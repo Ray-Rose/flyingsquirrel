@@ -28,6 +28,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # tag push → github.ref is the tag; manual dispatch → the `tag` input
+          # (so we never build the default branch by accident). Fallback keeps
+          # the tag-push path identical.
+          ref: ${{ github.event.inputs.tag || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -49,6 +54,11 @@ jobs:
           - x86_64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v4
+        with:
+          # tag push → github.ref is the tag; manual dispatch → the `tag` input
+          # (so we never build the default branch by accident). Fallback keeps
+          # the tag-push path identical.
+          ref: ${{ github.event.inputs.tag || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -104,6 +114,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # tag push → github.ref is the tag; manual dispatch → the `tag` input
+          # (so we never build the default branch by accident). Fallback keeps
+          # the tag-push path identical.
+          ref: ${{ github.event.inputs.tag || github.ref }}
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -122,6 +137,9 @@ jobs:
       - name: Create / update GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          # Explicit tag so manual workflow_dispatch runs attach to the chosen
+          # tag; on a tag push github.ref_name is that tag (same as the default).
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: |
             release/*.tar.gz
             release/SHA256SUMS

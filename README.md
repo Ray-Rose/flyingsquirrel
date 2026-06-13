@@ -1,5 +1,7 @@
 # FlyingSquirrel
 
+[![CI](https://github.com/Ray-Rose/flyingsquirrel/actions/workflows/ci.yml/badge.svg)](https://github.com/Ray-Rose/flyingsquirrel/actions/workflows/ci.yml)
+
 **GPS / IMU drift cross-correlator. Detects spoofed GPS in flight, severs the GPS link, and engages Return-to-Launch on inertial sensors.**
 
 Signal-capture attacks like the RQ-170 incident in 2011 work because the
@@ -427,9 +429,6 @@ GitHub Release. The `flyingsquirrel` binary's hash in `SHA256SUMS` matches the
 operator can cross-check that the binary running on the drone is exactly the
 released artifact. `mavsim` (the attack-trajectory test fixture) is deliberately
 excluded from release artifacts.
-
-> Once pushed to GitHub, add a status badge to the top of this file:
-> `![CI](https://github.com/<owner>/<repo>/actions/workflows/ci.yml/badge.svg)`
 
 ## What's deferred
 
