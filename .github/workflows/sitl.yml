@@ -1,0 +1,55 @@
+name: SITL validation (nightly)
+
+# Heavyweight CLOSED-LOOP validation against real ArduPilot SITL. Brings up
+# three containers on a private Docker network (SITL + the detector + a MAVLink
+# relay/choreographer), injects a GPS spoof, and — via
+# deploy/sitl/run-sitl-validation.sh — requires BOTH that the autopilot reaches
+# an RTL-equivalent mode AND that the detector's OWN event log shows a
+# Spoofed transition + ActionAcked (so a native-EKF reaction can't pass as a
+# detector success).
+#
+# This keeps the README's headline "validated end-to-end against ArduPilot SITL"
+# claim continuously re-checked instead of being a one-time manual result. It
+# depends on a third-party SITL image and Docker networking, so it runs on a
+# nightly schedule and on demand — NOT as a per-push gate (too slow and too
+# network-dependent to block PRs).
+on:
+  schedule:
+    - cron: "17 7 * * *" # ~07:17 UTC nightly
+  workflow_dispatch:
+    inputs:
+      glitch_m:
+        description: "GPS spoof magnitude in meters"
+        required: false
+        default: "400"
+
+permissions:
+  contents: read
+
+jobs:
+  sitl:
+    name: closed-loop SITL
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # The validation script expects the detector image to exist as
+      # flyingsquirrel:sitl; it builds the relay/harness image itself.
+      - name: Build detector image (flyingsquirrel:sitl)
+        run: docker build -f deploy/Dockerfile -t flyingsquirrel:sitl .
+
+      - name: Run closed-loop SITL validation
+        env:
+          GLITCH_M: ${{ github.event.inputs.glitch_m || '400' }}
+        run: bash deploy/sitl/run-sitl-validation.sh
+
+      # Always publish the detector's JSON event log + any forensic dumps so a
+      # failed run is diagnosable without re-running.
+      - name: Upload detector event log + forensic dumps
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sitl-detector-output
+          path: deploy/sitl/last-run/
+          if-no-files-found: ignore
