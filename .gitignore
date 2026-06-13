@@ -1,0 +1,28 @@
+# Rust build output
+/target/
+**/*.rs.bk
+
+# Cargo — Cargo.lock IS committed (this crate ships binaries; a locked
+# dependency set is required for reproducible release artifacts and the
+# CI `--locked` gate). Do NOT ignore it.
+
+# Demo / scratch artifacts produced by `cargo run --json-log ...` and the
+# forensic dumps. These are runtime output, never source.
+*.jsonl
+/spoof_demo.jsonl
+spoof-*.json
+/dist/
+/var-lib-flyingsquirrel/
+/var-log-flyingsquirrel/
+
+# SITL validation harness run output (deploy/sitl/run-sitl-validation.*).
+# Regenerated every run; never source.
+/deploy/sitl/last-run/
+/deploy/sitl/last-detector-log.txt
+
+# Editor / OS cruft
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/

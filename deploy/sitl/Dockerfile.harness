@@ -1,0 +1,15 @@
+# Tiny MAVLink relay/choreographer image for the SITL validation harness.
+#
+# python:slim + pip pymavlink gives us a MODERN pymavlink with pre-generated
+# dialect modules — no mavgen, no vendored-submodule dialect-generation pain
+# (the ArduPilot SITL image's vendored pymavlink needs that and has no pip).
+#
+# Build: docker build -f deploy/sitl/Dockerfile.harness -t fs-sitl-harness deploy/sitl
+FROM python:3.12-slim
+
+# pymavlink pulls in `future`; that's all the harness needs.
+RUN pip install --no-cache-dir pymavlink
+
+COPY sitl_harness.py /usr/local/bin/sitl_harness.py
+
+ENTRYPOINT ["python3", "/usr/local/bin/sitl_harness.py"]

@@ -1,0 +1,138 @@
+name: Release
+
+# Fires when a version tag is pushed (e.g. `git tag v0.1.0 && git push --tags`).
+# Builds release binaries for each deploy target, computes a SHA-256 manifest
+# (the SAME hash the binary prints in its startup ATTESTATION line, so an
+# operator can cross-check "the binary I'm running == the released artifact"),
+# and publishes them on a GitHub Release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (for manual runs)"
+        required: true
+
+permissions:
+  contents: write  # needed to create the GitHub Release + upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Gate the release on a green build+test first — never publish an artifact
+  # that didn't pass the suite.
+  verify:
+    name: verify before release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-targets --all-features
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: verify
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-unknown-linux-gnu
+          - armv7-unknown-linux-gnueabihf
+          - x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - name: Install cross linker
+        run: |
+          sudo apt-get update
+          case "${{ matrix.target }}" in
+            aarch64-unknown-linux-gnu)
+              sudo apt-get install -y gcc-aarch64-linux-gnu
+              echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+              echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+              ;;
+            armv7-unknown-linux-gnueabihf)
+              sudo apt-get install -y gcc-arm-linux-gnueabihf
+              echo "CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc" >> "$GITHUB_ENV"
+              echo "CC_armv7_unknown_linux_gnueabihf=arm-linux-gnueabihf-gcc" >> "$GITHUB_ENV"
+              ;;
+          esac
+      - name: Build release binaries (hw-i2c + journald)
+        run: cargo build --release --locked --features hw-i2c,journald --target ${{ matrix.target }}
+      - name: Stage artifacts + SHA-256 manifest
+        run: |
+          set -euo pipefail
+          TGT="${{ matrix.target }}"
+          OUT="dist/$TGT"
+          mkdir -p "$OUT"
+          # Ship the main detector binary and the watch TUI. mavsim is a test
+          # fixture (it emits ATTACK trajectories), deliberately NOT shipped.
+          for bin in flyingsquirrel flyingsquirrel-watch; do
+            cp "target/$TGT/release/$bin" "$OUT/"
+          done
+          # SHA-256 manifest — the flyingsquirrel binary's hash here MUST match
+          # the `sha256=` field in its startup ATTESTATION log line on the
+          # target device. That's the operator's integrity cross-check.
+          ( cd "$OUT" && sha256sum * > SHA256SUMS )
+          cat "$OUT/SHA256SUMS"
+          TARBALL="flyingsquirrel-${TGT}.tar.gz"
+          tar -C "$OUT" -czf "$TARBALL" .
+          sha256sum "$TARBALL" >> "$OUT/SHA256SUMS"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flyingsquirrel-${{ matrix.target }}
+          path: |
+            flyingsquirrel-${{ matrix.target }}.tar.gz
+            dist/${{ matrix.target }}/SHA256SUMS
+
+  publish:
+    name: publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Assemble combined manifest
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find artifacts -name '*.tar.gz' -exec cp {} release/ \;
+          echo "# flyingsquirrel release artifacts — SHA-256" > release/SHA256SUMS
+          find artifacts -name 'SHA256SUMS' -print0 | sort -z | while IFS= read -r -d '' f; do
+            echo "## ${f}" >> release/SHA256SUMS
+            cat "$f" >> release/SHA256SUMS
+          done
+          ls -la release/
+          cat release/SHA256SUMS
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*.tar.gz
+            release/SHA256SUMS
+          generate_release_notes: true
+          body: |
+            Automated release build.
+
+            **Integrity:** verify the downloaded binary against `SHA256SUMS`.
+            The `flyingsquirrel` hash also appears in the binary's startup
+            `ATTESTATION` log line on the target device — cross-check the two
+            to confirm the running binary matches this release.
+
+            `mavsim` (the attack-trajectory test fixture) is intentionally NOT
+            included in release artifacts.

@@ -1,0 +1,16 @@
+# Line-ending policy: store AND check out text files as LF on every platform.
+#
+# FlyingSquirrel runs on Linux — the companion computer (Pi/Jetson), the CI
+# runners, and the Docker images. A Windows checkout's CRLF would otherwise
+# break shell-script shebangs ("bad interpreter: /usr/bin/env bash^M"),
+# Dockerfile RUN steps, and the systemd unit on the target. `eol=lf` pins LF
+# in the working tree too, so the committed bytes are identical everywhere.
+* text=auto eol=lf
+
+# Belt-and-suspenders for the files that MUST be LF to execute on Linux.
+*.sh        text eol=lf
+*.py        text eol=lf
+*.service   text eol=lf
+Dockerfile* text eol=lf
+
+# PowerShell tolerates LF, so the .ps1 stays LF too (covered by the rule above).

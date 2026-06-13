@@ -1,0 +1,15 @@
+# Keep the build context small + reproducible.
+target/
+.git/
+.github/
+.vscode/
+.idea/
+*.log
+*.tmp
+spoof-events.jsonl
+spoof_demo.jsonl
+docs/
+# Keep examples + tests in the context — needed for the cargo build
+# step that compiles tests during `cargo build --release` (Cargo won't,
+# but if the build steps change to `cargo test --release`, we'd need
+# them). For now both directories are small.

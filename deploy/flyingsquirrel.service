@@ -1,0 +1,85 @@
+[Unit]
+# FlyingSquirrel GPS/IMU drift cross-correlator — anti-spoofing detector.
+#
+# Runs as a systemd-managed daemon on a companion computer (Pi / Jetson)
+# alongside the autopilot. Reads sensors over serial/I2C, talks MAVLink to
+# the autopilot, and severs GPS + engages RTL on detected spoofing.
+#
+# Install: sudo bash deploy/install.sh
+#          (or copy this file to /etc/systemd/system/flyingsquirrel.service
+#           by hand and follow the README's deployment section)
+Description=FlyingSquirrel GPS/IMU drift cross-correlator (anti-spoofing)
+Documentation=file:///usr/share/doc/flyingsquirrel/README.md
+# Start after the network is up — UDP MAVLink to the autopilot needs it.
+# Don't bind to network-online.target as a hard requirement: in many drone
+# deployments the network is loopback-only, and network-online would never
+# fire.
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/flyingsquirrel --config /etc/flyingsquirrel.toml
+
+# Restart on failure (panic, task supervisor exit, sensor disconnect) but
+# NOT on operator stop (`systemctl stop`). on-failure is the correct mode
+# here — `always` would mask real bugs by relaunching past assertion
+# failures repeatedly.
+Restart=on-failure
+RestartSec=5s
+
+# Throttle restart loops. If the detector dies and respawns 5 times in
+# 60s, something is structurally wrong (bad config, missing sensors,
+# permission failure). Stop trying so the operator can investigate
+# without log spam.
+StartLimitBurst=5
+StartLimitIntervalSec=60s
+
+# Run unprivileged. The `flyingsquirrel` user is created by the install
+# script and added to:
+#   - dialout (for /dev/ttyUSB* GPS access)
+#   - i2c     (for /dev/i2c-* IMU access on Pi / Jetson)
+User=flyingsquirrel
+Group=flyingsquirrel
+
+# Working directory for runtime state — JSON event logs, etc.
+WorkingDirectory=/var/lib/flyingsquirrel
+StateDirectory=flyingsquirrel
+StateDirectoryMode=0750
+
+# Process hardening. Most of these are no-ops in containerized
+# deployments but harmless. Drop ambient capabilities, no new
+# privileges, no /tmp escape.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=no   # need /dev/ttyUSB* + /dev/i2c-*
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/flyingsquirrel /var/log/flyingsquirrel
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+# UDP MAVLink + serial/I2C → AF_INET + AF_INET6 + AF_UNIX for journald.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# Logging — events stream to journald (the binary uses tracing-journald
+# when built with the `journald` feature). For the JSON event log, set
+# `[process].json_log = "/var/log/flyingsquirrel/events.jsonl"` in
+# /etc/flyingsquirrel.toml — that file is in ReadWritePaths above.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=flyingsquirrel
+
+# Operator-initiated reset via SIGHUP clears the SPOOFED latch:
+#   sudo systemctl kill -s HUP flyingsquirrel
+# (Documented in README under "Operator reset")
+# systemd's KillSignal is SIGTERM by default — keep that for graceful
+# shutdown. SIGHUP is for reset, not stop.
+KillSignal=SIGTERM
+TimeoutStopSec=10s
+
+[Install]
+WantedBy=multi-user.target

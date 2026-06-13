@@ -1,0 +1,143 @@
+name: CI
+
+# Runs on every push to a branch and every pull request. The jobs mirror the
+# exact commands a developer runs locally (see README "Testing") so a green
+# checkmark here means the same thing as a clean local run — and, crucially,
+# catches the class of bug where a real-hardware path silently breaks while the
+# default test suite stays green (e.g. audit I-01, the NMEA feature regression).
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Deny warnings everywhere, matching the local clippy gate.
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # ---- Formatting: fast, fail early ----
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  # ---- Lint + test on stable ----
+  test:
+    name: clippy + test (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy (all targets, all features, deny warnings)
+        # --all-features so the Linux-only hw-i2c + journald code paths are
+        # actually compiled and linted in CI (they're off by default and
+        # would otherwise never be checked).
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: test (default features)
+        run: cargo test --all-targets
+      - name: test (all features)
+        # Re-run with the hardware features on so the I2C / journald code is
+        # exercised by the unit tests that don't need real hardware. This is
+        # the job that would have caught audit I-01 (NMEA features compiled
+        # out → serial GPS silently produced zero fixes).
+        run: cargo test --all-targets --all-features
+      - name: doc tests
+        run: cargo test --doc
+
+  # ---- MSRV gate: prove the declared rust-version actually builds ----
+  msrv:
+    name: build @ MSRV (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      # Build only (not clippy/test) — MSRV is about "does it compile on the
+      # declared minimum", and older toolchains lint differently. --all-features
+      # so the hardware paths are included in the MSRV guarantee. 1.88 is the
+      # real floor, set by darling 0.23 + instability 0.3.12 (via ratatui).
+      # This job exists because earlier unverified MSRV claims (1.75/1.83/1.85)
+      # silently did not build — now the number is continuously proven.
+      - run: cargo build --all-targets --all-features --locked
+
+  # ---- Cross-compile for the real deploy targets ----
+  cross:
+    name: cross-compile (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-unknown-linux-gnu      # Pi 4/5, Jetson, modern ARM SBCs
+          - armv7-unknown-linux-gnueabihf  # older Pi, BeagleBone
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install cross linker
+        run: |
+          sudo apt-get update
+          case "${{ matrix.target }}" in
+            aarch64-unknown-linux-gnu)
+              sudo apt-get install -y gcc-aarch64-linux-gnu
+              echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+              echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+              ;;
+            armv7-unknown-linux-gnueabihf)
+              sudo apt-get install -y gcc-arm-linux-gnueabihf
+              echo "CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc" >> "$GITHUB_ENV"
+              echo "CC_armv7_unknown_linux_gnueabihf=arm-linux-gnueabihf-gcc" >> "$GITHUB_ENV"
+              ;;
+          esac
+      - name: Build release (hw-i2c + journald, matching deploy/cross-compile.sh)
+        run: cargo build --release --locked --features hw-i2c,journald --target ${{ matrix.target }}
+      - name: Verify ELF architecture
+        run: file "target/${{ matrix.target }}/release/flyingsquirrel"
+
+  # ---- Security advisory scan ----
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Scan dependency tree for RUSTSEC advisories
+        run: cargo audit --deny warnings
+
+  # ---- Docker image build (validates deploy/Dockerfile) ----
+  docker:
+    name: docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build runtime image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          push: false
+          tags: flyingsquirrel:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

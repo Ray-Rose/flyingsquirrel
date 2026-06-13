@@ -1,0 +1,35 @@
+# Example deployment config for an ArduCopter SITL or live-fire validation.
+# Used as: `flyingsquirrel --config examples/sitl-copter.toml`
+# Override any individual value via the matching CLI flag.
+
+[sources]
+gps_source = "mav"
+imu_source = "mav"
+controller = "mav"
+
+[mav]
+bind = "127.0.0.1:14551"
+target = "127.0.0.1:14550"
+target_system = 1
+target_component = 1
+vehicle = "ardu-copter"
+
+[i2c]
+# Not using a real I2C IMU here (imu_source = "mav"), but imu_rate also sizes
+# the dead-reckoning integration-gap gate for the MAVLink IMU. Set it to the
+# autopilot's SCALED_IMU stream rate (ArduPilot SR2_RAW_SENS) — a value far
+# above the real rate makes the gate skip every step and stalls dead-reckoning.
+imu_rate = 10.0
+
+[boot_anchor]
+# REQUIRED for production MAV deployment. Operator's launch site coords.
+# This must be within `max_home_distance_m` of the first GPS fix or the
+# detector emits `BootAnchorRejected` and refuses to anchor — defeats
+# meaconing-at-boot.
+expected_home = "40.7128,-74.0060"
+max_home_distance_m = 5000.0
+
+[process]
+duration = 600         # 10-minute demo flight
+log_level = "info"
+json_log = "spoof-events.jsonl"
