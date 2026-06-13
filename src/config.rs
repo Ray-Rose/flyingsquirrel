@@ -102,6 +102,9 @@ pub struct I2c {
     pub imu_bus: String,
     pub imu_addr: u8,
     pub imu_rate: f32,
+    /// Chip-to-body axis remap, e.g. `"Y,-X,Z"`. Default `"X,Y,Z"` (identity).
+    /// See `hw::axis_map::AxisMap`; applied only on the I2C IMU path.
+    pub axis_map: String,
 }
 
 impl Default for I2c {
@@ -110,6 +113,7 @@ impl Default for I2c {
             imu_bus: "/dev/i2c-1".into(),
             imu_addr: 0x68,
             imu_rate: 100.0,
+            axis_map: "X,Y,Z".into(),
         }
     }
 }

@@ -121,6 +121,14 @@ struct Cli {
     /// GPS cross-check.
     #[arg(long, default_value_t = 100.0)]
     imu_rate: f32,
+    /// Chip-to-body axis remap for an I2C IMU mounted in a non-standard
+    /// orientation. Three comma-separated signed axes naming the CHIP axis that
+    /// feeds each BODY axis (FRD: X-forward, Y-right, Z-down), e.g. "Y,-X,Z"
+    /// for a 90° yaw mount. Default "X,Y,Z" = chip mounted X-forward/Y-right/
+    /// Z-down. Must be a proper rotation (a reflection is rejected). Applies to
+    /// --imu-source i2c only.
+    #[arg(long, default_value = "X,Y,Z")]
+    imu_axis_map: String,
 
     // --- MAVLink options (used when any --*-source = mav OR --controller mav) ---
     /// Local UDP bind for MAVLink. Defaults to loopback for safety; only use
@@ -741,6 +749,9 @@ fn merge_config_into_cli(
     if !cli_explicit(matches, "imu_rate") {
         cli.imu_rate = cfg.i2c.imu_rate;
     }
+    if !cli_explicit(matches, "imu_axis_map") {
+        cli.imu_axis_map = cfg.i2c.axis_map.clone();
+    }
     // MAV
     if !cli_explicit(matches, "mav_bind") {
         cli.mav_bind = cfg
@@ -895,6 +906,7 @@ fn cli_to_app_config(cli: &Cli) -> AppConfig {
             imu_bus: cli.imu_bus.clone(),
             imu_addr: cli.imu_addr,
             imu_rate: cli.imu_rate,
+            axis_map: cli.imu_axis_map.clone(),
         },
         mav: Mav {
             bind: cli.mav_bind.to_string(),
@@ -1029,11 +1041,15 @@ fn build_synth_imu(cli: &Cli) -> SyntheticImu<LinearNorth> {
 
 #[cfg(all(feature = "hw-i2c", target_os = "linux"))]
 fn build_i2c_imu(cli: &Cli) -> Result<Box<dyn ImuSource>, FsError> {
+    use flyingsquirrel::hw::axis_map::AxisMap;
     use flyingsquirrel::hw::i2c_imu::{I2cImuConfig, I2cImuSource};
+    let axis_map = AxisMap::parse(&cli.imu_axis_map)
+        .map_err(|e| FsError::Config(format!("--imu-axis-map: {e}")))?;
     Ok(Box::new(I2cImuSource::new(I2cImuConfig {
         bus: cli.imu_bus.clone(),
         addr: cli.imu_addr,
         rate_hz: cli.imu_rate,
+        axis_map,
     })))
 }
 

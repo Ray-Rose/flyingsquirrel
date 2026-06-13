@@ -10,5 +10,10 @@
 
 pub mod serial_gps;
 
+/// Sensor-to-body axis remap (for arbitrarily-mounted IMUs). Not feature-gated
+/// so the remap math is unit-tested on every platform, even though it is only
+/// applied on the Linux I2C path today.
+pub mod axis_map;
+
 #[cfg(all(feature = "hw-i2c", target_os = "linux"))]
 pub mod i2c_imu;

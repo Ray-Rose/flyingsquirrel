@@ -11,6 +11,7 @@
 //! Cfg-gated on Linux + the `hw-i2c` feature.
 
 use crate::error::{FsError, IngestError};
+use crate::hw::axis_map::AxisMap;
 use crate::ingest::{BoxStream, ImuSource};
 use crate::mav::imu_sample_is_plausible;
 use crate::types::{ImuSample, Timestamp};
@@ -38,6 +39,10 @@ pub struct I2cImuConfig {
     pub bus: String,
     pub addr: u8,
     pub rate_hz: f32,
+    /// Chip-to-body axis remap for the mounting orientation. Default is
+    /// identity (chip mounted X-forward / Y-right / Z-down). See
+    /// [`crate::hw::axis_map::AxisMap`].
+    pub axis_map: AxisMap,
 }
 
 impl Default for I2cImuConfig {
@@ -46,6 +51,7 @@ impl Default for I2cImuConfig {
             bus: "/dev/i2c-1".to_string(),
             addr: MPU6050_DEFAULT_ADDR,
             rate_hz: 100.0,
+            axis_map: AxisMap::IDENTITY,
         }
     }
 }
@@ -84,7 +90,7 @@ fn open_and_init(cfg: &I2cImuConfig) -> Result<I2cdev, FsError> {
     Ok(bus)
 }
 
-fn read_one(bus: &mut I2cdev, addr: u8) -> Result<ImuSample, std::io::Error> {
+fn read_one(bus: &mut I2cdev, addr: u8, axis_map: &AxisMap) -> Result<ImuSample, std::io::Error> {
     let mut buf = [0u8; 14];
     bus.write_read(addr, &[REG_ACCEL_XOUT_H], &mut buf)
         .map_err(|e| std::io::Error::other(format!("i2c read: {:?}", e)))?;
@@ -96,18 +102,24 @@ fn read_one(bus: &mut I2cdev, addr: u8) -> Result<ImuSample, std::io::Error> {
     let gy = i16::from_be_bytes([buf[10], buf[11]]);
     let gz = i16::from_be_bytes([buf[12], buf[13]]);
 
+    // Scale to SI in the chip frame, then remap chip axes → FRD body frame for
+    // the mounting orientation. The remap is a proper rotation, so the same map
+    // applies to accel and gyro. Identity map = pass-through (default).
+    let accel = axis_map.apply([
+        ax as f32 * G_PER_LSB * G_TO_MPS2,
+        ay as f32 * G_PER_LSB * G_TO_MPS2,
+        az as f32 * G_PER_LSB * G_TO_MPS2,
+    ]);
+    let gyro = axis_map.apply([
+        (gx as f32 * DEG_S_PER_LSB).to_radians(),
+        (gy as f32 * DEG_S_PER_LSB).to_radians(),
+        (gz as f32 * DEG_S_PER_LSB).to_radians(),
+    ]);
+
     Ok(ImuSample {
         t: Timestamp::now_mono(),
-        accel_mps2: [
-            ax as f32 * G_PER_LSB * G_TO_MPS2,
-            ay as f32 * G_PER_LSB * G_TO_MPS2,
-            az as f32 * G_PER_LSB * G_TO_MPS2,
-        ],
-        gyro_rps: [
-            (gx as f32 * DEG_S_PER_LSB).to_radians(),
-            (gy as f32 * DEG_S_PER_LSB).to_radians(),
-            (gz as f32 * DEG_S_PER_LSB).to_radians(),
-        ],
+        accel_mps2: accel,
+        gyro_rps: gyro,
     })
 }
 
@@ -140,7 +152,7 @@ impl ImuSource for I2cImuSource {
                 ticker.tick().await;
                 // I2C is blocking; for 100 Hz at ~1 ms per read this is acceptable
                 // on its own task. If it becomes a problem, wrap in spawn_blocking.
-                match read_one(&mut bus, cfg.addr) {
+                match read_one(&mut bus, cfg.addr, &cfg.axis_map) {
                     Ok(sample) => {
                         // Reset error tracking on a successful read.
                         if consecutive_errors > 0 {
