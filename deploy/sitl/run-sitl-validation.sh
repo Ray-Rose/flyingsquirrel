@@ -86,7 +86,7 @@ docker run -d --name fs-detector --network "$NET" --ip "$DET_IP" \
     --vehicle ardu-copter \
     --mav-bind 0.0.0.0:14551 --mav-target "${HARNESS_IP}:14551" \
     --mav-no-source-filter \
-    --expected-home "${HOME_LAT},${HOME_LON}" --max-home-distance-m 5000 \
+    --expected-home="${HOME_LAT},${HOME_LON}" --max-home-distance-m 5000 \
     --json-log /out/events.jsonl --forensic-dir /out \
     --imu-rate 10 \
     --duration 180 --log-level info >/dev/null

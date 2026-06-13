@@ -200,7 +200,11 @@ struct Cli {
     /// `BootAnchorRejected` and refuses to anchor — defends against
     /// meaconing-at-boot (attacker already broadcasting a spoofed location
     /// when the drone powers up).
-    #[arg(long)]
+    // allow_hyphen_values: a southern/western launch site has a negative
+    // coordinate (e.g. `--expected-home -35.36,149.16`); without this clap reads
+    // the leading `-3...` as an unknown flag ("unexpected argument '-3'"). This
+    // bit the SITL harness against ArduPilot's Canberra default home.
+    #[arg(long, allow_hyphen_values = true)]
     expected_home: Option<String>,
     #[arg(long, default_value_t = 1000.0)]
     max_home_distance_m: f64,
@@ -1099,4 +1103,21 @@ fn spawn_reset_signal_handler(tx: mpsc::Sender<()>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn expected_home_accepts_negative_coordinates() {
+        // A southern/western launch site has a negative coordinate. Without
+        // `allow_hyphen_values` clap rejects the leading '-' as an unknown flag
+        // ("unexpected argument '-3'") — which crashed the detector container in
+        // the SITL harness against ArduPilot's Canberra default home.
+        let cli =
+            Cli::try_parse_from(["flyingsquirrel", "--expected-home", "-35.363261,149.16523"])
+                .expect("negative expected-home must parse");
+        assert_eq!(cli.expected_home.as_deref(), Some("-35.363261,149.16523"));
+    }
 }
