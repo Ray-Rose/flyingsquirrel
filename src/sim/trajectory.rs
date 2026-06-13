@@ -55,6 +55,51 @@ impl TrajectoryGenerator for LinearNorth {
     }
 }
 
+/// Constant-speed level circle in the horizontal plane: starts at the origin
+/// heading +N and turns right (toward +E) at yaw rate ω = speed / radius.
+///
+/// Unlike `LinearNorth`/`Static` (identity attitude, zero accel, zero gyro),
+/// this exercises the WHOLE nav stack under rotation: the Madgwick filter must
+/// track a continuously-changing yaw, the strapdown must integrate a non-zero
+/// (centripetal) linear acceleration, and the gyro path carries a real yaw
+/// rate. That's where attitude/integration errors and accel-bias coupling show
+/// up — exactly the regime the old sim never covered (audit S-09/S-10).
+#[derive(Debug, Clone, Copy)]
+pub struct CircleHorizontal {
+    pub speed_mps: f64,
+    pub radius_m: f64,
+}
+
+impl TrajectoryGenerator for CircleHorizontal {
+    fn sample(&self, t: f64) -> GroundTruth {
+        let v = self.speed_mps;
+        let r = self.radius_m.max(1e-3);
+        let omega = v / r; // yaw rate (rad/s) about NED-down
+        let theta = omega * t; // heading from +N, increasing toward +E
+        let (s, c) = theta.sin_cos();
+        // body→NED attitude: pure yaw of θ about the (down) Z axis. Level.
+        let half = (theta * 0.5) as f32;
+        GroundTruth {
+            t_secs: t,
+            pos_n: r * s,
+            pos_e: r * (1.0 - c),
+            pos_d: 0.0,
+            vel_n: v * c,
+            vel_e: v * s,
+            vel_d: 0.0,
+            // Centripetal acceleration (d/dt of velocity), pointing toward the
+            // circle centre.
+            acc_n: -v * omega * s,
+            acc_e: v * omega * c,
+            acc_d: 0.0,
+            q: [half.cos(), 0.0, 0.0, half.sin()],
+            gyro_n: 0.0,
+            gyro_e: 0.0,
+            gyro_d: omega,
+        }
+    }
+}
+
 /// Stationary at the origin (with body attitude identity). Useful for
 /// false-alarm tests.
 #[derive(Debug, Clone, Copy, Default)]

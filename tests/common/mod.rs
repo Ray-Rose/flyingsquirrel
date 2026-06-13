@@ -1,6 +1,12 @@
 //! Shared test harness. Builds a `SyntheticGps` + `SyntheticImu` from a
 //! `Scenario` description, wires the runtime via `spawn_all`, and provides
 //! a `TestController` that records all events into a shared Vec.
+//!
+//! Each integration test file `mod common;`-includes this and uses a different
+//! SUBSET of it (e.g. `scenario_realistic` only needs `TestController`), so
+//! items unused by a given binary would otherwise trip `-D warnings`. Allow
+//! dead code module-wide — it's a shared harness, not product code.
+#![allow(dead_code)]
 
 use async_trait::async_trait;
 use flyingsquirrel::action::FlightController;
@@ -125,6 +131,7 @@ pub async fn run_scenario(s: Scenario) -> ScenarioOutcome {
         accel_sigma: 0.001,
         gyro_sigma: 0.0001,
         gyro_bias: [0.0; 3],
+        accel_bias: [0.0; 3],
         seed: s.seed.wrapping_add(1),
         duration_s: s.duration_s as f32 + 2.0,
     };

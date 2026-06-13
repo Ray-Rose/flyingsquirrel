@@ -1034,6 +1034,7 @@ fn build_synth_imu(cli: &Cli) -> SyntheticImu<LinearNorth> {
         accel_sigma: 0.001,
         gyro_sigma: 0.0001,
         gyro_bias: [0.0; 3],
+        accel_bias: [0.0; 3],
         seed: cli.seed.wrapping_add(1),
         duration_s: cli.duration as f32 + 2.0,
     }

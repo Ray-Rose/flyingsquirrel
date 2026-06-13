@@ -83,6 +83,11 @@ pub struct SyntheticImu<T: TrajectoryGenerator + Send + 'static> {
     pub accel_sigma: f32,
     pub gyro_sigma: f32,
     pub gyro_bias: [f32; 3],
+    /// Constant body-frame accelerometer bias (m/s²). Real MEMS turn-on bias
+    /// that the boot static-init can't fully remove; it double-integrates into
+    /// DR position drift, so it is what actually stresses the residual
+    /// thresholds over a multi-minute flight (the old sim had none).
+    pub accel_bias: [f32; 3],
     pub seed: u64,
     pub duration_s: f32,
 }
@@ -95,6 +100,7 @@ impl<T: TrajectoryGenerator + Send + 'static> ImuSource for SyntheticImu<T> {
             accel_sigma,
             gyro_sigma,
             gyro_bias,
+            accel_bias,
             seed,
             duration_s,
         } = *self;
@@ -118,9 +124,9 @@ impl<T: TrajectoryGenerator + Send + 'static> ImuSource for SyntheticImu<T> {
                 );
                 let body = uq.inverse_transform_vector(&total_ned);
                 let accel = [
-                    body.x + gauss(&mut rng) as f32 * accel_sigma,
-                    body.y + gauss(&mut rng) as f32 * accel_sigma,
-                    body.z + gauss(&mut rng) as f32 * accel_sigma,
+                    body.x + accel_bias[0] + gauss(&mut rng) as f32 * accel_sigma,
+                    body.y + accel_bias[1] + gauss(&mut rng) as f32 * accel_sigma,
+                    body.z + accel_bias[2] + gauss(&mut rng) as f32 * accel_sigma,
                 ];
                 let gyro_body = uq.inverse_transform_vector(&Vector3::new(
                     gt.gyro_n as f32,

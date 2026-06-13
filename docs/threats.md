@@ -350,6 +350,53 @@ real; and corrected the `SIM_GPS_GLITCH_*` units (degrees, not meters) in
 All `cargo test` (114 lib + 9 property + integration), `cargo clippy
 --all-targets -D warnings`, and `cargo fmt --all --check` stay green.
 
+### Phase 3 hardware-mounting + realistic-robustness (this pass)
+
+| ID | Severity | Fix / finding |
+|---|---|---|
+| **P3-AXISMAP** | 🟡 | **Fixed.** I2C IMUs mounted in any non-FRD orientation were passed through with raw chip axes (N-01 residual), so DR integrated a rotated signal. New `hw/axis_map.rs` — a signed axis permutation validated as a proper rotation (det +1, so it can't chirality-flip the gyro), applied at the i2c read path with an `--imu-axis-map "Y,-X,Z"` / `[i2c].axis_map` surface. Cross-platform unit-tested; Linux compile CI-verified. Physical validation still needs real hardware. |
+
+#### 🔴 CRITICAL KNOWN LIMITATION — false alarms under realistic sensor error
+
+A new realistic-noise harness (`tests/scenario_realistic.rs`, + accel-bias and a
+`CircleHorizontal` turning trajectory added to the sim) **empirically proves the
+detector false-latches `Spoofed` — i.e. severs GPS and commands RTL on a
+perfectly healthy drone — under realistic conditions.** The existing integration
+scenarios pass only because they use ~10× cleaner GPS (σ=0.3 m) and ~30× cleaner
+IMU noise than reality. Three compounding causes, each an `#[ignore]`d
+characterization test that flips to passing once fixed:
+
+1. **Per-axis CUSUM is not adaptive** (audit B-? / nav-review #2). The per-axis
+   drift `k` is fixed at 1.0 m while only the *magnitude* lane learns its noise
+   floor. At realistic GPS σ=2.5 m the per-axis CUSUM ramps on honest noise and
+   false-fires within ~90 s even with a near-perfect IMU. **Fix:** drive per-axis
+   `k`/`h` from an online per-axis residual-σ EWMA, mirroring the magnitude lane.
+2. **DR drift vs the cumulative-since-anchor residual** (nav-review #3). Realistic
+   IMU noise/bias random-walks the dead-reckoned position; because the residual is
+   GPS minus the *never-re-anchored* DR position, that wander is a persistent
+   offset the CUSUM reads as slow drift. **Fix:** a sliding-window residual
+   (compare GPS-vs-DR *displacement* over a short window, differencing out
+   accumulated DR error) and/or in-flight accel-bias estimation.
+3. **Centripetal attitude coupling** (nav-review #4). In a sustained coordinated
+   turn the centripetal specific force tilts the Madgwick "down" (~6°), coupling
+   through gravity compensation into a ~60 m residual. (Gating the accel
+   correction off during turns was tried and is WRONG — it removes the gravity
+   reference and lets gyro bias diverge the attitude far worse.) **Fix:** GPS-aided
+   attitude — subtract the GPS-velocity-derived centripetal acceleration before
+   the accel correction.
+
+**This is a pre-real-flight blocker and the single highest-priority follow-up.**
+It does not affect the v0.1.0 release pipeline or the other defenses, but the
+detector must NOT be flown against a real GPS/IMU until at least (1) and (2) are
+fixed and re-validated. The fixes are deliberately deferred to a dedicated,
+separately-validated pass: they are safety-critical detection-math changes where
+a careless threshold change would cause MISSED detections (worse than false
+alarms), so they must not be rushed.
+
+All non-ignored `cargo test`, `cargo clippy --all-targets -D warnings`, and
+`cargo fmt --all --check` stay green (the realistic false-alarms are `#[ignore]`d
+characterizations, run with `cargo test --test scenario_realistic -- --ignored`).
+
 ---
 
 ## 11. References and proof execution
