@@ -355,6 +355,8 @@ All `cargo test` (114 lib + 9 property + integration), `cargo clippy
 | ID | Severity | Fix / finding |
 |---|---|---|
 | **P3-AXISMAP** | 🟡 | **Fixed.** I2C IMUs mounted in any non-FRD orientation were passed through with raw chip axes (N-01 residual), so DR integrated a rotated signal. New `hw/axis_map.rs` — a signed axis permutation validated as a proper rotation (det +1, so it can't chirality-flip the gyro), applied at the i2c read path with an `--imu-axis-map "Y,-X,Z"` / `[i2c].axis_map` surface. Cross-platform unit-tested; Linux compile CI-verified. Physical validation still needs real hardware. |
+| **P3-SITLCI** | 🟢 | **Fixed (S-04).** SITL validation was manual-only. Added `.github/workflows/sitl.yml` — a nightly + on-demand job that builds the detector image, runs `deploy/sitl/run-sitl-validation.sh` (closed-loop ArduPilot SITL), gates on the detector's own event log (Spoofed + ActionAcked), and uploads the event log/forensic dumps. Best-effort (third-party SITL image + Docker networking), so it's NOT a per-push gate. |
+| **P3-PX4** | 🟡 | **Detector side done + documented; live run pending environment.** PX4 support (sever param, packed-mode RTL, autopilot cross-check) is implemented and unit-tested (Phase 1), and the manual PX4 SITL run is documented (`docs/sitl.md` §"Running against PX4 SITL", with a precise status callout). NOT done: a containerized one-command PX4 harness + an actual end-to-end PX4 SITL run — PX4's Gazebo/jMAVSim stack differs from ArduPilot's and can't be exercised from the Windows dev box. This is the standing **PX4 SITL milestone**. |
 
 #### 🔴 CRITICAL KNOWN LIMITATION — false alarms under realistic sensor error
 

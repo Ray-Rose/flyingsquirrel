@@ -245,6 +245,30 @@ cargo run --release -- \
 
 ## Running against PX4 SITL
 
+**Status (be precise about what is and isn't validated):**
+
+- ✅ **Detector PX4 support is implemented and unit-tested.** The PX4 profile
+  drives: the GPS-sever parameter (`EKF2_GPS_CTRL=0`, not ArduPilot's
+  `GPS_TYPE` — see `sever_gps_param`), RTL via `DO_SET_MODE` with the
+  `CUSTOM_MODE_ENABLED` bit, the packed `(main<<24)|(sub<<16)` custom-mode
+  decode (`is_rtl_mode` / `px4_split_mode`), and the `MAV_AUTOPILOT_PX4`
+  cross-check. Covered by `sever_param_is_profile_specific`,
+  `rtl_mode_recognition_px4`, `px4_mode_encoding_round_trips`, and the
+  `proptest` PX4-codec invariants.
+- ✅ **The manual run is documented** (below) and works against a PX4 SITL you
+  bring up yourself.
+- ⏳ **A containerized one-command PX4 harness** (the PX4 sibling of
+  `deploy/sitl/run-sitl-validation.sh`) and an **actual end-to-end PX4 SITL
+  run** are NOT done. The ArduPilot harness is ArduPilot-specific (its SITL
+  container image, env, and `SIM_GPS_GLITCH_*` spoof injection don't carry over
+  to PX4's Gazebo/jMAVSim stack). PX4 SITL also can't be exercised from the
+  Windows dev box this was built on. **This is the remaining "PX4 SITL
+  milestone": run the manual path below against live PX4 SITL, record the
+  observed mode sequence in a `## Findings` section, and (if it works) build a
+  containerized PX4 harness + a `sitl-px4.yml` CI job.** The relay-mode spoof in
+  `sitl_harness.py` is autopilot-agnostic, so a PX4 containerized harness can
+  reuse it once a working PX4 SITL image is wired up.
+
 PX4 has its own SITL stack (uses Gazebo or jMAVSim instead of ArduPilot's
 in-process simulator). The FlyingSquirrel side is identical — only the
 `--vehicle` flag changes.
