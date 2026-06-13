@@ -123,7 +123,9 @@ impl MavFlightController {
             Some(path) => {
                 #[cfg(unix)]
                 let file = {
-                    use std::os::unix::fs::OpenOptionsExt;
+                    // tokio's OpenOptions::mode() is inherent on unix — no std
+                    // OpenOptionsExt import needed (it's an unused-import error
+                    // under -D warnings on the Linux build).
                     tokio::fs::OpenOptions::new()
                         .create(true)
                         .append(true)

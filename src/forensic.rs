@@ -335,11 +335,11 @@ pub async fn dump_to_disk(snap: &ForensicSnapshot, dir: &Path) -> Result<PathBuf
     // crashed prior write doesn't get reused (operator should clean those).
     let mut open_opts = tokio::fs::OpenOptions::new();
     open_opts.write(true).create_new(true);
+    // tokio's OpenOptions has an inherent `mode()` on unix — no std trait import
+    // needed (importing OpenOptionsExt is an unused-import error under -D warnings,
+    // a Linux-only build that Windows dev can't see; CI caught it).
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        open_opts.mode(0o600);
-    }
+    open_opts.mode(0o600);
     let mut file = open_opts.open(&tmp_path).await.map_err(|e| {
         FsError::Io(std::io::Error::new(
             e.kind(),
