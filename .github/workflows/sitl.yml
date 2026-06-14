@@ -10,11 +10,15 @@ name: SITL validation (nightly)
 #
 # Runs in a matrix over the spoof-injection mode (fail-fast disabled so the legs
 # are independent):
-#   relay — wire-level meaconing the detector sees directly. Proves the full
-#           detect -> sever -> RTL -> read-back chain against real firmware/timing.
-#   param — ramps ArduPilot's SIM_GPS_GLITCH gradually so EK3 FUSES it; the EKF's
-#           fused output (position + self-consistent velocity) is the EKF-laundered
-#           "smart spoofer" the detector's velocity-aiding lane must catch.
+#   relay       — step wire-level meaconing the detector sees directly (naive
+#                 position jump). Proves detect -> sever -> RTL -> read-back.
+#   relay-smart — ramps lat/lon AND fakes matching Doppler, so the detector sees a
+#                 consistent-velocity walk-off the position blend masks; the
+#                 velocity-aiding lane (Phase 2a) makes the catch end-to-end.
+#   param       — ramps ArduPilot's SIM_GPS_GLITCH gradually so EK3 FUSES it;
+#                 proves the autopilot's OWN EKF was on the spoofed GPS and that
+#                 the sever makes it drop the GPS lane. (Position-only at the raw
+#                 receiver, so the detector catches it via the position lane.)
 #
 # This keeps the README's headline "validated end-to-end against ArduPilot SITL"
 # claim continuously re-checked instead of being a one-time manual result. It
@@ -50,6 +54,15 @@ jobs:
             glitch_m: "300"
             ramp_secs: "60"
             detector_duration: "260"
+          # Consistent-velocity wire spoof (Phase 2c) — the relay ramps lat/lon
+          # AND fakes matching Doppler, so the position blend masks the residual
+          # and the velocity-aiding lane (Phase 2a) makes the catch. A slow ramp
+          # (~1.5 m/s = 90 m / 60 s) keeps it clearly in velocity-aiding territory
+          # (above the ~1 m/s floor, far below the 15 m/s velocity-mismatch gate).
+          - mode: relay-smart
+            glitch_m: "90"
+            ramp_secs: "60"
+            detector_duration: "220"
     steps:
       - uses: actions/checkout@v4
 

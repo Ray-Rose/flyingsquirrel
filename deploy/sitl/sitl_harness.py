@@ -29,6 +29,7 @@ Exit code 0 only if the detector-driven autopilot reaches an RTL-equivalent
 mode (RTL/LAND/SMART_RTL) after the spoof — i.e. the whole chain worked.
 """
 import argparse
+import math
 import socket
 import sys
 import threading
@@ -125,6 +126,17 @@ class Relay:
         self.spoof_active = False
         self.spoof_dlat_deg = 0.0
         self.spoof_dlon_deg = 0.0
+        # Smart-relay (consistent-velocity) extension. When `spoof_smart`, the
+        # position offset RAMPS over `spoof_ramp_secs` instead of stepping, and a
+        # MATCHING east velocity bias (`spoof_rate_e_mps`) is written into the
+        # forwarded GPS so reported position and Doppler stay mutually consistent
+        # — the faked-Doppler "smart spoofer" the velocity-aiding lane targets,
+        # which neither the step relay nor param mode produces (param glitches the
+        # raw receiver position only, leaving Doppler honest = a naive signature).
+        self.spoof_smart = False
+        self.spoof_start_t = 0.0
+        self.spoof_ramp_secs = 60.0
+        self.spoof_rate_e_mps = 0.0
         # Latest EKF_STATUS_REPORT (ArduPilot streams it once data streams are
         # requested). The param-mode evidence: whether EK3 FUSED the gradual
         # SIM_GPS_GLITCH ramp (GPS_GLITCHING clear, POS_HORIZ_ABS set) rather than
@@ -135,21 +147,54 @@ class Relay:
         self.ekf_vel_var = None
         self.ekf_pos_horiz_var = None
 
+    def _current_spoof_offset(self):
+        """(dlat_deg, dlon_deg, dvel_e_mps) for this instant. The step relay
+        returns the fixed offset with no velocity bias; the smart relay ramps the
+        position offset and reports a consistent east velocity bias WHILE ramping
+        (zero once it caps, where the position holds steady)."""
+        if not self.spoof_smart:
+            return (self.spoof_dlat_deg, self.spoof_dlon_deg, 0.0)
+        frac = (time.time() - self.spoof_start_t) / max(self.spoof_ramp_secs, 0.1)
+        if frac >= 1.0:
+            return (self.spoof_dlat_deg, self.spoof_dlon_deg, 0.0)
+        return (frac * self.spoof_dlat_deg, frac * self.spoof_dlon_deg,
+                self.spoof_rate_e_mps)
+
+    def _rewrite_velocity_east(self, msg, mt, dvel_e_mps):
+        """Add `dvel_e_mps` (east, m/s) to the message's reported velocity so the
+        Doppler stays CONSISTENT with the ramping position. GLOBAL_POSITION_INT
+        carries NED cm/s (vx/vy/vz, vy=east); GPS_RAW_INT carries polar ground
+        speed (`vel`, cm/s) + course (`cog`, cdeg), so we go via N/E components."""
+        de_cms = dvel_e_mps * 100.0
+        if mt == "GLOBAL_POSITION_INT":
+            msg.vy = int(round(msg.vy + de_cms))
+            return
+        # GPS_RAW_INT — skip if the receiver didn't report velocity/course
+        # (UINT16_MAX unknown sentinel); the detector would ignore it anyway.
+        if msg.vel == 65535 or msg.cog == 65535:
+            return
+        cog_rad = math.radians(msg.cog / 100.0)
+        vn = msg.vel * math.cos(cog_rad)
+        ve = msg.vel * math.sin(cog_rad) + de_cms
+        msg.vel = int(round(math.hypot(vn, ve)))
+        msg.cog = int(round(math.degrees(math.atan2(ve, vn)) % 360.0 * 100.0))
+
     def _maybe_spoof_and_serialize(self, msg, mt):
         """Return the bytes to forward for `msg`. When the spoof is armed and
         `msg` carries position (GPS_RAW_INT / GLOBAL_POSITION_INT), rewrite its
-        lat/lon by the configured degree offset and re-encode; otherwise return
+        lat/lon (and, in smart mode, its velocity) and re-encode; otherwise return
         the original raw bytes unchanged.
 
         lat/lon in both messages are int32 in 1e-7 degrees, so the offset is
         `round(deg * 1e7)`."""
         if not self.spoof_active or mt not in ("GPS_RAW_INT", "GLOBAL_POSITION_INT"):
             return msg.get_msgbuf()
-        dlat = int(round(self.spoof_dlat_deg * 1e7))
-        dlon = int(round(self.spoof_dlon_deg * 1e7))
+        dlat_deg, dlon_deg, dvel_e_mps = self._current_spoof_offset()
         try:
-            msg.lat += dlat
-            msg.lon += dlon
+            msg.lat += int(round(dlat_deg * 1e7))
+            msg.lon += int(round(dlon_deg * 1e7))
+            if dvel_e_mps != 0.0:
+                self._rewrite_velocity_east(msg, mt, dvel_e_mps)
             # Re-encode against the relay's own mav so the CRC is recomputed.
             # Use the original sender's sysid/compid so the detector's sysid
             # filter still accepts it (the autopilot is sysid 1).
@@ -292,10 +337,16 @@ def main():
     # degrees of longitude. Defaults to CMAC (Canberra), ArduPilot's default
     # SITL home; PX4's default is Zurich (47.397742) — pass --home-lat.
     ap.add_argument("--home-lat", type=float, default=-35.363261)
-    # Spoof injection mechanism: `relay` rewrites GPS lat/lon in the forwarded
-    # stream (vehicle-agnostic; the only path that works for PX4). `param`
-    # spoofs ArduPilot's simulated GPS via SIM_GPS_GLITCH_Y.
-    ap.add_argument("--spoof-mode", choices=["relay", "param"], default="relay")
+    # Spoof injection mechanism:
+    #   relay       — step-rewrite GPS lat/lon in the forwarded stream (naive
+    #                 position jump; vehicle-agnostic, the only path for PX4).
+    #   relay-smart — RAMP lat/lon AND rewrite Doppler consistently, so the
+    #                 detector sees a faked-Doppler "smart spoofer" — the
+    #                 consistent-velocity signature the velocity-aiding lane
+    #                 targets (Phase 2c).
+    #   param       — spoof ArduPilot's simulated GPS via a gradual SIM_GPS_GLITCH
+    #                 ramp the EKF fuses (proves EKF-fusion + sever-drops-lane).
+    ap.add_argument("--spoof-mode", choices=["relay", "relay-smart", "param"], default="relay")
     # PARAM-MODE ramp duration. A STEP SIM_GPS_GLITCH is innovation-gated by
     # ArduPilot's EK3 (rejected — proves nothing); ramping it gradually over this
     # many seconds keeps each epoch's position jump under the gate so the EKF
@@ -312,11 +363,11 @@ def main():
     # margin, or the loop tears down before the EKF-fused offset grows enough to
     # detect. Auto-extend so callers don't have to keep --watch-secs in sync with
     # --glitch-ramp-secs.
-    if args.spoof_mode == "param":
+    if args.spoof_mode in ("param", "relay-smart"):
         needed = args.glitch_ramp_secs + 45.0
         if args.watch_secs < needed:
-            log("param mode: extending --watch-secs {:.0f} -> {:.0f} to cover the "
-                "ramp + detection".format(args.watch_secs, needed))
+            log("{} mode: extending --watch-secs {:.0f} -> {:.0f} to cover the "
+                "ramp + detection".format(args.spoof_mode, args.watch_secs, needed))
             args.watch_secs = needed
 
     r = Relay(args.sitl, args.det_host, args.det_port)
@@ -401,17 +452,37 @@ def main():
     dlon_deg = args.glitch_m / (111320.0 * max(math.cos(lat_rad), 1e-6))
 
     param_mode = args.spoof_mode == "param"
-    if not param_mode:
+    if args.spoof_mode == "relay":
         # Wire-level meaconing: the relay rewrites the lat/lon of every GPS
         # message it forwards to the detector. Vehicle-agnostic — works
         # identically for PX4 and ArduPilot, no simulator GPS-glitch param
         # needed (PX4 has no clean equivalent). Models the attack the detector
         # exists to catch: the position the companion sees is offset from truth.
-        # Applied as a step here.
-        log("INJECTING SPOOF (relay wire-level): +{:.6f} deg lon (~{} m east at lat {})".format(
+        # Applied as a step here, Doppler left honest (a naive signature).
+        log("INJECTING SPOOF (relay wire-level, step): +{:.6f} deg lon (~{} m east at lat {})".format(
             dlon_deg, args.glitch_m, args.home_lat))
         r.spoof_dlat_deg = 0.0
         r.spoof_dlon_deg = dlon_deg
+        r.spoof_active = True
+    elif args.spoof_mode == "relay-smart":
+        # Consistent-velocity wire spoof (Phase 2c): the relay RAMPS the lat/lon
+        # offset AND rewrites the forwarded GPS Doppler to match, so the detector
+        # (which reads GPS_RAW_INT) sees a position+velocity-CONSISTENT walk-off —
+        # the faked-Doppler "smart spoofer" / EKF-laundered signature the
+        # velocity-aiding lane (Phase 2a) targets. The position blend tracks the
+        # spoofed velocity and masks the position residual, so this should be
+        # caught by the velocity-aiding lane, not the position lane. The ramp runs
+        # in the relay thread over --glitch-ramp-secs.
+        rate_e = args.glitch_m / max(args.glitch_ramp_secs, 0.1)
+        log("INJECTING SPOOF (relay-smart consistent-velocity): ramp +{:.6f} deg lon "
+            "(~{} m east) over {:.0f}s = {:.2f} m/s east, with matching Doppler".format(
+                dlon_deg, args.glitch_m, args.glitch_ramp_secs, rate_e))
+        r.spoof_dlat_deg = 0.0
+        r.spoof_dlon_deg = dlon_deg
+        r.spoof_rate_e_mps = rate_e
+        r.spoof_ramp_secs = args.glitch_ramp_secs
+        r.spoof_start_t = time.time()
+        r.spoof_smart = True
         r.spoof_active = True
     else:
         # SITL-param injection (ArduPilot only): bias the autopilot's OWN

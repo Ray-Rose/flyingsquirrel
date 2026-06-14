@@ -51,10 +51,12 @@
 > (`GPS_RAW_INT`), which `SIM_GPS_GLITCH` offsets in POSITION only (honest
 > Doppler), so from the detector's view this is a NAIVE spoof caught by the
 > position lane — param mode validates the EKF-fusion + sever-drops-lane path, NOT
-> the velocity-aiding lane. Exercising the velocity-aiding lane (Phase 2a)
-> end-to-end on SITL needs a consistent-velocity WIRE spoof (a "smart relay" that
-> fakes Doppler too — a noted follow-up); that lane is currently proven by the
-> local `ConsistentDrift` characterization (`tests/scenario_consistent_drift.rs`).
+> the velocity-aiding lane. The velocity-aiding lane (Phase 2a) is exercised
+> end-to-end by the **`relay-smart`** matrix leg (SITL **Phase 2c**): the relay
+> ramps lat/lon AND fakes a matching Doppler, so the position blend masks the
+> residual and the velocity-aiding lane makes the catch on real SITL/MAVLink
+> timing. That lane is also proven by the local `ConsistentDrift` characterization
+> (`tests/scenario_consistent_drift.rs`).
 >
 > ### Bugs this validation found and fixed (invisible to `mavsim`)
 > The whole point of testing against real firmware: `mavsim` was circular (it
