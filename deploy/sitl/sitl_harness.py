@@ -374,18 +374,21 @@ def main():
     r.start()
     log("relay started (SITL<->detector both directions)")
 
-    # ArduPilot SITL does not stream GPS_RAW_INT / SCALED_IMU at a useful rate
-    # until a GCS requests them. Ask for ALL streams at 10 Hz (legacy
-    # REQUEST_DATA_STREAM, still honored by ArduPilot) so the detector — and
-    # our wait_gps — actually see position + IMU traffic. Send a few times
-    # since early requests can be dropped during SITL bring-up.
-    sysid0, compid0 = r.sitl.target_system, r.sitl.target_component
-    for _ in range(3):
-        r.sitl.mav.request_data_stream_send(
-            sysid0, compid0,
-            mavutil.mavlink.MAV_DATA_STREAM_ALL, 10, 1)  # 10 Hz, start
-        time.sleep(1)
-    log("requested all MAVLink data streams @10Hz")
+    is_px4 = args.vehicle == "px4"
+
+    # ArduPilot SITL does not stream GPS_RAW_INT / SCALED_IMU until a GCS requests
+    # them (legacy REQUEST_DATA_STREAM, still honored by ArduPilot). PX4 streams
+    # the offboard set (HIGHRES_IMU + GPS_RAW_INT) on 14540 by DEFAULT — the
+    # bring-up smoke confirmed the detector reaches preflight Ready without a
+    # request — so skip it for PX4.
+    if not is_px4:
+        sysid0, compid0 = r.sitl.target_system, r.sitl.target_component
+        for _ in range(3):
+            r.sitl.mav.request_data_stream_send(
+                sysid0, compid0,
+                mavutil.mavlink.MAV_DATA_STREAM_ALL, 10, 1)  # 10 Hz, start
+            time.sleep(1)
+        log("requested all MAVLink data streams @10Hz")
 
     if not r.wait_gps():
         log("FAIL: no GPS fix (SITL never reported a 3D fix — see notes in docs/sitl.md)")
@@ -393,46 +396,70 @@ def main():
 
     sysid, compid = r.sitl.target_system, r.sitl.target_component
 
-    # Disable pre-arm checks, set home at the current location, and let the EKF
-    # settle so GUIDED can arm in the bare SITL (no RC/battery). W4/W-ARMED: with
-    # only ARMING_CHECK=0 and a plain arm command the copter often stayed
-    # `armed=False` on the ground — then a later RTL disarms instantly and the
-    # detector (correctly, its armed cross-check) reports the disarmed autopilot
-    # as RTL-unconfirmed. ARMING_CHECK=0 is the SITL scripted-test standard
-    # (NEVER for a real vehicle).
-    log("ARMING_CHECK=0 + DO_SET_HOME(current) for SITL scripted arm")
-    for _ in range(3):
-        r.set_param("ARMING_CHECK", 0)
-        time.sleep(0.5)
-    # MAV_CMD_DO_SET_HOME param1=1 -> use current location as home/origin.
-    r.sitl.mav.command_long_send(sysid, compid, mavutil.mavlink.MAV_CMD_DO_SET_HOME,
-                                 0, 1, 0, 0, 0, 0, 0, 0)
-    time.sleep(8)  # let the EKF settle / set its origin with checks relaxed
-
-    # Choreograph: GUIDED, force-arm, takeoff. All SEND-ONLY — the relay thread
-    # is the sole reader of the SITL connection, so we must not call any
-    # recv-blocking helper (it would deadlock against the relay). We send raw
-    # commands, pace with sleeps, and observe arm/mode/alt via the relay state.
-    log("mode GUIDED (custom_mode=4)")
-    r.sitl.mav.set_mode_send(
-        sysid, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 4)
-    time.sleep(3)
-    # Force-arm (param2 = 21196 magic, bypasses residual checks) and CONFIRM via
-    # the HEARTBEAT armed bit before proceeding — a plain arm silently failed.
-    log("force-arming (MAV_CMD_COMPONENT_ARM_DISARM param1=1 param2=21196)")
-    arm_deadline = time.time() + 30
-    while time.time() < arm_deadline and not r.is_armed():
-        r.sitl.mav.command_long_send(
-            sysid, compid, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-            0, 1, 21196, 0, 0, 0, 0, 0)
-        time.sleep(1.5)
-    log("armed={} ; takeoff to {} m".format(r.is_armed(), args.takeoff_alt))
-    for _ in range(3):
-        r.sitl.mav.command_long_send(
-            sysid, compid, mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
-            0, 0, 0, 0, 0, 0, 0, args.takeoff_alt)
-        time.sleep(1)
-    # Confirm airborne so the later RTL keeps the copter armed through the
+    # Arm + take off. SEND-ONLY: the relay thread is the sole reader of the SITL
+    # connection, so we must not call any recv-blocking helper (it would deadlock
+    # against the relay) — we send raw commands, pace with sleeps, and observe
+    # arm/mode/alt via the relay state. The sequence is vehicle-specific.
+    if is_px4:
+        # PX4 has no ARMING_CHECK param. Relax RC-loss arming (COM_RCL_EXCEPT bit
+        # 2 = 4) and set the takeoff altitude, force-arm (PX4 also honors the
+        # 21196 magic), then command NAV_TAKEOFF — PX4 auto-engages AUTO.TAKEOFF
+        # (main=4/sub=2). SITL-only relaxations, never a real vehicle.
+        log("PX4: COM_RCL_EXCEPT=4 + takeoff alt {} m".format(args.takeoff_alt))
+        for _ in range(3):
+            r.set_param("COM_RCL_EXCEPT", 4)
+            r.set_param("COM_TKO_ALT", float(args.takeoff_alt))
+            r.set_param("MIS_TAKEOFF_ALT", float(args.takeoff_alt))
+            time.sleep(0.5)
+        time.sleep(5)  # let params apply / EKF settle
+        log("PX4 force-arming (COMPONENT_ARM_DISARM param1=1 param2=21196)")
+        arm_deadline = time.time() + 30
+        while time.time() < arm_deadline and not r.is_armed():
+            r.sitl.mav.command_long_send(
+                sysid, compid, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                0, 1, 21196, 0, 0, 0, 0, 0)
+            time.sleep(1.5)
+        log("PX4 armed={} ; NAV_TAKEOFF to {} m (AUTO.TAKEOFF)".format(
+            r.is_armed(), args.takeoff_alt))
+        for _ in range(3):
+            r.sitl.mav.command_long_send(
+                sysid, compid, mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+                0, 0, 0, 0, 0, 0, 0, args.takeoff_alt)
+            time.sleep(1.5)
+    else:
+        # ArduCopter: relax pre-arm checks + DO_SET_HOME, GUIDED, force-arm,
+        # takeoff. W4/W-ARMED: with only ARMING_CHECK=0 and a plain arm the bare
+        # copter often stayed disarmed on the ground — then a later RTL disarms
+        # instantly and the detector (correctly) reports it RTL-unconfirmed.
+        # ARMING_CHECK=0 is the SITL scripted-test standard (NEVER a real vehicle).
+        log("ARMING_CHECK=0 + DO_SET_HOME(current) for SITL scripted arm")
+        for _ in range(3):
+            r.set_param("ARMING_CHECK", 0)
+            time.sleep(0.5)
+        # MAV_CMD_DO_SET_HOME param1=1 -> use current location as home/origin.
+        r.sitl.mav.command_long_send(sysid, compid, mavutil.mavlink.MAV_CMD_DO_SET_HOME,
+                                     0, 1, 0, 0, 0, 0, 0, 0)
+        time.sleep(8)  # let the EKF settle / set its origin with checks relaxed
+        log("mode GUIDED (custom_mode=4)")
+        r.sitl.mav.set_mode_send(
+            sysid, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 4)
+        time.sleep(3)
+        # Force-arm (param2 = 21196 magic) and CONFIRM via the HEARTBEAT armed bit
+        # before proceeding — a plain arm silently failed.
+        log("force-arming (COMPONENT_ARM_DISARM param1=1 param2=21196)")
+        arm_deadline = time.time() + 30
+        while time.time() < arm_deadline and not r.is_armed():
+            r.sitl.mav.command_long_send(
+                sysid, compid, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                0, 1, 21196, 0, 0, 0, 0, 0)
+            time.sleep(1.5)
+        log("armed={} ; takeoff to {} m".format(r.is_armed(), args.takeoff_alt))
+        for _ in range(3):
+            r.sitl.mav.command_long_send(
+                sysid, compid, mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+                0, 0, 0, 0, 0, 0, 0, args.takeoff_alt)
+            time.sleep(1)
+    # Confirm airborne so a later RTL keeps the vehicle armed through the
     # detector's read-back dwell (descending from altitude takes >> the 5 s
     # verify window, so it stays armed long enough to confirm ActionAcked).
     r.wait_airborne(args.takeoff_alt * 0.5)

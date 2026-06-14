@@ -45,3 +45,28 @@ jobs:
           name: px4-smoke-output
           path: deploy/sitl/last-run/
           if-no-files-found: ignore
+
+  px4-closed-loop:
+    name: PX4 SITL closed loop
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build detector image (flyingsquirrel:sitl)
+        run: docker build -f deploy/Dockerfile -t flyingsquirrel:sitl .
+
+      - name: PX4 closed-loop validation
+        run: bash deploy/sitl/run-px4-validation.sh
+
+      - name: Make detector output readable for upload
+        if: always()
+        run: sudo chmod -R a+r deploy/sitl/last-run/ 2>/dev/null || true
+
+      - name: Upload detector event log + forensic dumps
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: px4-closed-loop-output
+          path: deploy/sitl/last-run/
+          if-no-files-found: ignore
