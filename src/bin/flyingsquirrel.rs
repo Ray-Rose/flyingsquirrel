@@ -668,7 +668,16 @@ async fn run() -> Result<(), FsError> {
     if !handles.fusion.is_finished() {
         let _ = handles.fusion.await;
     }
-    handles.action.abort();
+    // AUDIT (shutdown event-trail loss): do NOT abort the action task here.
+    // It is the ONLY broadcast subscriber that persists events to the JSON log
+    // (ConsoleController::on_event), and the background tasks drained below
+    // (forensic dump, RTL verify, sever read-back) emit their outcome events —
+    // including the CRITICAL sever-readback-unconfirmed — DURING the drain. The
+    // old order aborted the logger first, so those events were silently dropped
+    // even though the drain preserved the forensic dump file itself: the event
+    // trail was lost on the exact shutdown-during-spoof path the drain exists to
+    // protect. The action task is stopped AFTER the drain (below).
+
     // Audit E-10 fix: drain in-flight background tasks (forensic dump,
     // RTL verify) with a bounded timeout. 7s = 5s verify window + 2s
     // forensic-write headroom. Tasks still running past the deadline are
@@ -689,11 +698,30 @@ async fn run() -> Result<(), FsError> {
     } else if drained > 0 {
         tracing::info!(drained, "drained pending background tasks cleanly");
     }
+    // Stop the remaining event PRODUCERS (heartbeat watchdog, MAV listener),
+    // awaiting their teardown so their broadcast-sender clones are dropped.
     if let Some(h) = mav_listener_join.take() {
         h.abort();
+        let _ = h.await;
     }
     if let Some(h) = watchdog_handle.take() {
         h.abort();
+        let _ = h.await;
+    }
+    // With fusion (awaited above), the drained background tasks, and the
+    // producers all gone, drop main's own sender clone: the broadcast channel
+    // now has no senders, so the action subscriber returns Closed as soon as it
+    // has flushed the events buffered during the drain, then exits. Bounded so a
+    // stray sender can never hang process exit; abort is the safety net. The
+    // is_finished() guard avoids re-polling a handle the select already drove to
+    // completion (the task_died:action exit reason).
+    drop(handles.events_tx);
+    if !handles.action.is_finished()
+        && tokio::time::timeout(Duration::from_secs(2), &mut handles.action)
+            .await
+            .is_err()
+    {
+        handles.action.abort();
     }
     // Hold the `mav_link` Arc in scope until shutdown so tasks holding clones
     // (listener, watchdog, controller) see consistent lifetime ordering, then
