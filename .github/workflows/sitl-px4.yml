@@ -1,0 +1,47 @@
+name: PX4 SITL bring-up (smoke)
+
+# Step 1 of the PX4 live-SITL milestone. Stands up headless PX4 SITL
+# (jonasvautherin/px4-gazebo-headless, which PUSHES MAVLink to a target) and the
+# detector receiving directly, to confirm the PX4 topology + GPS/HIGHRES_IMU
+# parsing + preflight Ready before the full PX4 closed-loop harness exists. The
+# detector-side PX4 support (sever EKF2_GPS_CTRL, PX4 RTL-mode decode) is already
+# unit-tested; this is the first LIVE PX4 exercise.
+#
+# Dispatch + push-on-the-WIP-branch for now (no schedule) — it's a heavier
+# third-party Gazebo image and a work-in-progress milestone, not yet a gate. The
+# branch-scoped push trigger lets it auto-run each iteration before the workflow
+# exists on the default branch (where `gh workflow run` would resolve it); remove
+# the push trigger when this is promoted.
+on:
+  workflow_dispatch:
+  push:
+    branches: [feat/px4-sitl]
+
+permissions:
+  contents: read
+
+jobs:
+  px4-smoke:
+    name: PX4 SITL bring-up smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build detector image (flyingsquirrel:sitl)
+        run: docker build -f deploy/Dockerfile -t flyingsquirrel:sitl .
+
+      - name: PX4 bring-up smoke
+        run: bash deploy/sitl/run-px4-smoke.sh
+
+      - name: Make detector output readable for upload
+        if: always()
+        run: sudo chmod -R a+r deploy/sitl/last-run/ 2>/dev/null || true
+
+      - name: Upload detector event log + forensic dumps
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: px4-smoke-output
+          path: deploy/sitl/last-run/
+          if-no-files-found: ignore
