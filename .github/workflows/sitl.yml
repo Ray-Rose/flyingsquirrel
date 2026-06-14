@@ -44,6 +44,14 @@ jobs:
           GLITCH_M: ${{ github.event.inputs.glitch_m || '400' }}
         run: bash deploy/sitl/run-sitl-validation.sh
 
+      # The detector writes forensic dumps 0o600 (owner-only) as a non-root
+      # container user (uid 1000), so the runner can't read them to zip for
+      # upload (EACCES, which failed the whole job). Relax read perms for the
+      # artifact step only — these are throwaway CI dumps, not production data.
+      - name: Make detector output readable for upload
+        if: always()
+        run: sudo chmod -R a+r deploy/sitl/last-run/ 2>/dev/null || true
+
       # Always publish the detector's JSON event log + any forensic dumps so a
       # failed run is diagnosable without re-running.
       - name: Upload detector event log + forensic dumps

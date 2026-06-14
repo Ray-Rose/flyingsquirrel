@@ -236,6 +236,10 @@ def main():
     ap.add_argument("--clean-secs", type=float, default=25.0)
     ap.add_argument("--glitch-m", type=float, default=400.0)
     ap.add_argument("--watch-secs", type=float, default=45.0)
+    # After the autopilot reaches RTL, keep the relay running this long so the
+    # detector's RTL read-back DWELL (several fresh HEARTBEATs in RTL) completes
+    # and it logs ActionAcked — those heartbeats only reach it through the relay.
+    ap.add_argument("--verify-grace-secs", type=float, default=15.0)
     # Home latitude — used to convert the desired east glitch (metres) to
     # degrees of longitude. Defaults to CMAC (Canberra), ArduPilot's default
     # SITL home; PX4's default is Zurich (47.397742) — pass --home-lat.
@@ -350,10 +354,26 @@ def main():
     log("watching {} s for detector-driven RTL ({})...".format(args.watch_secs, args.vehicle))
     spoof_t = time.time()
     end = spoof_t + args.watch_secs
+    grace = args.verify_grace_secs
     reached_rtl = False
-    while time.time() < end:
-        if is_rtl_equiv(args.vehicle, r.last_mode):
+    rtl_at = None
+    # After the autopilot reaches RTL, KEEP the relay running for `grace` more
+    # seconds. The detector confirms RTL via a read-back DWELL (several fresh
+    # HEARTBEATs observed in RTL mode), and those heartbeats only reach it
+    # THROUGH this relay. The old code tore down on the first RTL heartbeat,
+    # starving the dwell, so the detector never emitted ActionAcked — which made
+    # run-sitl-validation.sh's ActionAcked assertion fail even though the full
+    # detect->sever->RTL chain worked.
+    while True:
+        now = time.time()
+        if rtl_at is None and is_rtl_equiv(args.vehicle, r.last_mode):
+            rtl_at = now
             reached_rtl = True
+            log("autopilot reached RTL-equivalent; holding the relay {:.0f}s so the "
+                "detector's RTL read-back dwell completes (ActionAcked)".format(grace))
+        if rtl_at is not None and now - rtl_at >= grace:
+            break
+        if rtl_at is None and now >= end:
             break
         time.sleep(0.5)
 
