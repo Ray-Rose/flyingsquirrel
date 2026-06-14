@@ -49,6 +49,13 @@ pub enum SpoofPattern {
     /// honest. Exercises the vertical-rate spoof check (audit B-42), which
     /// the horizontal-only patterns never trigger.
     AltitudeJump { apply_at_s: f32, jump_m: f32 },
+    /// Strip the Doppler (speed/course) from every fix at or after `after_s`,
+    /// leaving lat/lon honest. Simulates a receiver that stops reporting
+    /// velocity (or an attacker stripping it to disable velocity-mismatch
+    /// detection). With the complementary velocity blend off, dead-reckoning
+    /// drifts unbounded — the regime that stresses the position residual the
+    /// most over a long flight.
+    DropDoppler { after_s: f32 },
 }
 
 pub struct SpoofInjector<G: GpsSource> {
@@ -141,6 +148,14 @@ fn apply_spoof(fix: &mut GpsFix, pattern: &SpoofPattern, elapsed_s: f64) {
         }
         return;
     }
+    // Doppler strip — clears speed/course only, leaving lat/lon honest.
+    if let SpoofPattern::DropDoppler { after_s } = pattern {
+        if elapsed_s >= *after_s as f64 {
+            fix.speed_mps = None;
+            fix.course_deg = None;
+        }
+        return;
+    }
 
     let (dn, de) = match pattern {
         SpoofPattern::Clean => (0.0, 0.0),
@@ -167,7 +182,9 @@ fn apply_spoof(fix: &mut GpsFix, pattern: &SpoofPattern, elapsed_s: f64) {
             // Handled stateful at the stream level — see into_stream.
             (0.0, 0.0)
         }
-        SpoofPattern::VelocityInconsistent { .. } | SpoofPattern::AltitudeJump { .. } => {
+        SpoofPattern::VelocityInconsistent { .. }
+        | SpoofPattern::AltitudeJump { .. }
+        | SpoofPattern::DropDoppler { .. } => {
             unreachable!("handled above")
         }
     };

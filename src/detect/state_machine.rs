@@ -59,6 +59,15 @@ pub struct StateMachine {
     /// Set when the consecutive cap or the cumulative budget is exceeded;
     /// consumed by Fusion to emit a `DwellPauseExceeded` event.
     pub dwell_pause_exceeded_pending: bool,
+    /// Whether the CUMULATIVE-position-residual detectors (drift CUSUM +
+    /// hard-residual jump) are active. Fusion disables them during sustained
+    /// no-Doppler (step 2): without GPS velocity, an accumulated DR-drift offset
+    /// is indistinguishable from a spoof (both make GPS sit far from the
+    /// dead-reckoned position), so these only false-latch a healthy drone. The
+    /// Doppler-INDEPENDENT detectors (frozen-GPS, vertical-rate) — which compare
+    /// GPS to the IMU directly, not to the accumulated residual — stay active.
+    /// Re-enabled the instant Doppler returns.
+    pos_detectors_enabled: bool,
 }
 
 // NB: an earlier `dwell_paused_s` accumulator was removed (audit C5). The
@@ -88,7 +97,21 @@ impl StateMachine {
             paused_cumulative_s: 0.0,
             pause_budget_warned: false,
             dwell_pause_exceeded_pending: false,
+            pos_detectors_enabled: true,
         }
+    }
+
+    /// Enable/disable the cumulative-residual detectors (drift CUSUM +
+    /// hard-residual jump) — step 2 no-Doppler policy. Disabling resets both so
+    /// stale accumulation can't fire when Doppler returns. The velocity-mismatch
+    /// jump is already inert without Doppler; frozen-GPS / vertical-rate are
+    /// unaffected (they drive the FSM via `note_external_anomaly`).
+    pub fn set_pos_detectors_enabled(&mut self, on: bool) {
+        if !on && self.pos_detectors_enabled {
+            self.drift.reset();
+            self.jump.reset();
+        }
+        self.pos_detectors_enabled = on;
     }
 
     /// Called by `Fusion` before `evaluate()` when the current fix is the
@@ -224,8 +247,17 @@ impl StateMachine {
             self.consecutive_dropout = 0;
         }
 
-        let jump = self.jump.evaluate(r, hdop, sats);
-        let drift = self.drift.evaluate(r, hdop, sats);
+        // Cumulative-residual detectors, gated off during sustained no-Doppler
+        // (step 2). Frozen-GPS / vertical-rate still drive the FSM via the
+        // `pending_external` flag below, so they remain effective.
+        let (jump, drift) = if self.pos_detectors_enabled {
+            (
+                self.jump.evaluate(r, hdop, sats),
+                self.drift.evaluate(r, hdop, sats),
+            )
+        } else {
+            (None, None)
+        };
 
         // Use the external-anomaly flag drained at the top.
         let detector_firing = jump.is_some() || drift.is_some() || pending_external;
@@ -682,6 +714,47 @@ mod tests {
                 "dropout streak in Normal must not raise DwellPauseExceeded"
             );
         }
+    }
+
+    #[test]
+    fn pos_detectors_gate_blocks_drift_jump_but_not_external() {
+        // Step 2 no-Doppler policy: with the cumulative-residual detectors gated
+        // off, a large position residual must NOT escalate (drift/jump suppressed)
+        // — but a frozen-GPS / vertical-rate anomaly (the `note_external_anomaly`
+        // path) MUST still escalate.
+        let mut sm = StateMachine::new(DetectConfig::default());
+        sm.set_pos_detectors_enabled(false);
+        for s in 0..=15 {
+            sm.evaluate(&big_jump(), s as f64, None, None);
+        }
+        assert_eq!(
+            sm.state(),
+            NavStateKind::Normal,
+            "gated cumulative-residual detectors must not latch on a big residual"
+        );
+        sm.note_external_anomaly();
+        let evs = sm.evaluate(&big_jump(), 16.0, None, None);
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                Event::Transition {
+                    to: NavStateKind::Suspicious,
+                    ..
+                }
+            )),
+            "an external (frozen/vertical) anomaly must still escalate while gated"
+        );
+
+        // Re-enabling restores jump/drift detection.
+        let mut sm2 = StateMachine::new(DetectConfig::default());
+        sm2.set_pos_detectors_enabled(false);
+        sm2.set_pos_detectors_enabled(true);
+        sm2.evaluate(&big_jump(), 0.0, None, None);
+        assert_eq!(
+            sm2.state(),
+            NavStateKind::Suspicious,
+            "re-enabled detectors must fire again"
+        );
     }
 
     #[test]

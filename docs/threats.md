@@ -408,21 +408,40 @@ to the low-noise baseline):**
    unit test. (Gating the accel correction off during turns was tried and is WRONG —
    it removes the gravity reference and lets gyro bias diverge the attitude.)
 
-**Status:** all three realistic-noise characterizations now pass (no false-latch on
-linear flight, on accel/gyro bias, or in a sustained coordinated turn), with the
-full attack-regression suite green — no desensitization (`per_axis_real_drift_still_fires…`,
+**Status:** all three realistic-noise characterizations pass (no false-latch on
+linear flight, accel/gyro bias, or a sustained coordinated turn), with the full
+attack-regression suite green — no desensitization (`per_axis_real_drift_still_fires…`,
 `spoof_during_turn_is_still_detected`, plus every `scenario_*` attack test pass).
-The remaining hardening is **step 2 — the sliding-window residual** (GPS-vs-DR
-displacement over a window), recommended for robustness on flights longer or more
-dynamic than the 90–120 s characterizations, where *unbounded* cumulative DR drift
-could still exceed the adaptive per-axis floor. Step 2 also subsumes the FSM
-clear-gate fix (`state_machine.rs` `pos_clean` still uses the base `cusum_k_m`, so
-clearing from Suspicious is hard at σ=2.5 m). That is robustness hardening, not a
-known false-latch. Each step was done as a dedicated, separately-validated pass:
-safety-critical detection-math where a careless change would cause MISSED detections
-(worse than false alarms).
 
-All `cargo test` (incl. all promoted regressions and the missed-detection guard),
+**Step 2 — no-Doppler degraded-mode policy (done).** The sliding-window residual
+originally scoped for step 2 turned out NOT to be justified for normal flight: the
+complementary velocity blend already bounds DR drift indefinitely when GPS Doppler
+is present (verified clean to 20 min — `long_doppler_flight_does_not_false_fire`).
+The real false-latch is the **no-Doppler** case: when GPS reports position but no
+velocity (a failing receiver, an intermittent dropout, or an attacker stripping
+Doppler to disable velocity-mismatch detection), the blend goes silent, DR drifts
+unbounded, and the cumulative residual false-latched a healthy drone in ~2 min.
+Fix (`fusion.rs` + `state_machine.rs`): once Doppler has been absent for ≥10
+consecutive fixes, DISABLE the cumulative-residual detectors (drift CUSUM +
+hard-residual jump) — without a velocity reference, accumulated DR drift is
+indistinguishable from a spoof, so they only false-latch. The Doppler-INDEPENDENT
+detectors (frozen-GPS, vertical-rate) stay active and can still escalate to Spoofed.
+Inherent tradeoff (accepted; operator warned via the no-Doppler SyncWarning):
+horizontal slow-drift / teleport detection is suspended while Doppler is absent —
+there is no independent velocity reference to separate a spoof from honest DR drift,
+and coupling GPS position into DR to bound it would both hide slow spoofs AND blind
+frozen-GPS. Guarded by `no_doppler_flight_does_not_false_fire` (no false-latch when
+Doppler drops mid-flight) and `frozen_gps_during_no_doppler_is_still_detected` (a
+stuck/replayed GPS with no Doppler still latches Spoofed).
+
+**Remaining (minor, not a known false-latch):** the FSM clear-gate
+(`state_machine.rs` `pos_clean` uses base `cusum_k_m`, so clearing from Suspicious
+is hard at σ=2.5 m) — latent robustness only, not exercised on clean flight since
+steps 1/3 keep the detector from entering Suspicious. Each step was a dedicated,
+separately-validated pass: safety-critical detection-math where a careless change
+would cause MISSED detections (worse than false alarms).
+
+All `cargo test` (incl. all promoted regressions and the missed-detection guards),
 `cargo clippy --all-targets -D warnings`, and `cargo fmt --all --check` are green.
 No realistic characterizations remain `#[ignore]`d.
 

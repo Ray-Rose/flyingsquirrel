@@ -284,6 +284,14 @@ const FROZEN_MIN_IMU_DISPLACEMENT_M: f64 = 5.0;
 /// and DR velocity noise on a parked vehicle must not slowly accumulate
 /// phantom displacement.
 const FROZEN_FIX_MIN_IMU_VEL_MPS: f64 = 1.0;
+/// Once GPS Doppler has been absent for at least this many consecutive fixes,
+/// disable the cumulative-residual detectors (drift CUSUM + hard-residual jump):
+/// without a velocity reference, the unbounded DR drift they accumulate is
+/// indistinguishable from a spoof, so they only false-latch a healthy drone
+/// (~2 min). Step 2 no-Doppler policy; aligned with the no-Doppler SyncWarning
+/// (also at 10) so the operator alert and the gating engage together. Frozen-GPS
+/// and vertical-rate stay active throughout.
+const NO_DOPPLER_GATE_STREAK: u16 = 10;
 
 impl Fusion {
     pub fn new(cfg: FusionConfig, boot: Instant) -> Self {
@@ -1036,6 +1044,17 @@ impl Fusion {
         // this, a vetoed transition resets the dwell clock and the attacker
         // can cycle veto→reset indefinitely without escalating to Spoofed.
         let pre_eval_suspicious_since = self.fsm.suspicious_since();
+
+        // Step 2 no-Doppler policy: once Doppler has been absent long enough,
+        // disable the cumulative-residual detectors (drift CUSUM + hard-residual
+        // jump). Without GPS velocity the DR drift they accumulate is
+        // indistinguishable from a spoof, so they only false-latch a healthy
+        // drone. Frozen-GPS and vertical-rate (Doppler-independent) stay active
+        // and can still escalate to Spoofed. Re-enabled the instant Doppler
+        // returns (`dvel_known`), or before the streak is sustained.
+        self.fsm.set_pos_detectors_enabled(
+            dvel_known || self.no_doppler_streak < NO_DOPPLER_GATE_STREAK,
+        );
 
         // Hand the residual to the state machine.
         let evs = self.fsm.evaluate(&r, t_gps_secs, fix.hdop, fix.sats);

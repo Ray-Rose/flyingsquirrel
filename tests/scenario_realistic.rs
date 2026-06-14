@@ -62,6 +62,7 @@ where
         gyro_bias,
         seed,
         SpoofPattern::Clean,
+        None,
     )
     .await
 }
@@ -80,6 +81,7 @@ async fn run_flight<T>(
     gyro_bias: [f32; 3],
     seed: u64,
     pattern: SpoofPattern,
+    also: Option<SpoofPattern>,
 ) -> Vec<SpoofingEvent>
 where
     T: TrajectoryGenerator + Send + Sync + Copy + 'static,
@@ -108,7 +110,11 @@ where
 
     let controller = Arc::new(TestController::new());
     let events_handle = controller.events.clone();
-    let gps_boxed: Box<dyn GpsSource> = Box::new(SpoofInjector::new(gps, pattern));
+    let gps_boxed: Box<dyn GpsSource> = match also {
+        // Compose two patterns (e.g. DropDoppler then Frozen) by nesting injectors.
+        Some(outer) => Box::new(SpoofInjector::new(SpoofInjector::new(gps, pattern), outer)),
+        None => Box::new(SpoofInjector::new(gps, pattern)),
+    };
     let imu_boxed: Box<dyn ImuSource> = Box::new(imu);
     let handles = spawn_all(
         gps_boxed,
@@ -250,6 +256,90 @@ async fn sustained_turn_does_not_false_fire() {
     );
 }
 
+/// EXPLORATORY (step-2 characterization): does a LONG clean flight false-latch?
+/// Steps 1+3 bound the residual over 90–120 s, but cumulative DR drift grows
+/// without bound, so a 10-minute flight is the real test of whether the
+/// cumulative-since-anchor residual still needs the sliding-window fix.
+/// REGRESSION (step 2): a long clean flight WITH Doppler does not false-latch —
+/// the complementary velocity blend bounds DR drift indefinitely (verified to
+/// 20 min). This is why the long-flight cumulative-drift false-latch the
+/// sliding-window residual was scoped for never materializes in normal flight.
+#[tokio::test(start_paused = true)]
+async fn long_doppler_flight_does_not_false_fire() {
+    let events = run_clean_flight(
+        LinearNorth { speed_mps: 8.0 },
+        600,
+        2.5,
+        0.03,
+        0.002,
+        [0.05, -0.04, 0.03],
+        [0.001, -0.001, 0.0015],
+        0x5EED_1234_5EED_1234,
+    )
+    .await;
+    assert!(
+        !spoofed("doppler-600s", &events),
+        "a 10-min Doppler flight must not false-latch"
+    );
+}
+
+/// REGRESSION (step 2): a clean flight whose GPS LOSES Doppler mid-flight must
+/// not false-latch. Without velocity the blend can't bound DR drift, so the
+/// cumulative residual grows unbounded and used to false-latch a healthy drone
+/// in ~2 min. The no-Doppler policy gates the cumulative-residual detectors
+/// (drift CUSUM + hard-residual jump) once Doppler has been absent long enough,
+/// relying on the Doppler-independent frozen-GPS / vertical-rate detectors.
+#[tokio::test(start_paused = true)]
+async fn no_doppler_flight_does_not_false_fire() {
+    let events = run_flight(
+        LinearNorth { speed_mps: 8.0 },
+        300,
+        2.5,
+        0.03,
+        0.002,
+        [0.05, -0.04, 0.03],
+        [0.001, -0.001, 0.0015],
+        0x5EED_1234_5EED_1234,
+        SpoofPattern::DropDoppler { after_s: 20.0 },
+        None,
+    )
+    .await;
+    assert!(
+        !spoofed("no-doppler", &events),
+        "a clean flight that loses Doppler must NOT false-latch (cumulative-residual \
+         detectors gated; Doppler-independent detectors retained)"
+    );
+}
+
+/// MISSED-DETECTION GUARD (step 2): gating the cumulative-residual detectors off
+/// in no-Doppler must NOT blind the Doppler-INDEPENDENT frozen-GPS detector. A
+/// stuck/replayed GPS (pinned lat/lon) after Doppler is lost must STILL latch
+/// Spoofed — frozen-GPS compares GPS to IMU displacement directly, and DR stays
+/// un-aided (no GPS-position coupling), so the IMU still shows the real motion.
+/// Doppler is present for the first 20 s so DR velocity is established before the
+/// dropout, then the GPS freezes at 40 s.
+#[tokio::test(start_paused = true)]
+async fn frozen_gps_during_no_doppler_is_still_detected() {
+    let events = run_flight(
+        LinearNorth { speed_mps: 8.0 },
+        120,
+        2.5,
+        0.03,
+        0.002,
+        [0.05, -0.04, 0.03],
+        [0.001, -0.001, 0.0015],
+        0x5EED_1234_5EED_1234,
+        SpoofPattern::DropDoppler { after_s: 20.0 },
+        Some(SpoofPattern::Frozen { freeze_at_s: 40.0 }),
+    )
+    .await;
+    assert!(
+        spoofed("frozen-no-doppler", &events),
+        "a frozen/replayed GPS with no Doppler MUST still be detected — frozen-GPS is \
+         Doppler-independent and must survive the no-Doppler detector gating"
+    );
+}
+
 /// MISSED-DETECTION GUARD for step 3: the inertial centripetal compensation
 /// must not HIDE a real spoof during a turn. Same realistic-noise coordinated
 /// turn, but a 2 m/s GPS position drift is injected partway through — the
@@ -274,6 +364,7 @@ async fn spoof_during_turn_is_still_detected() {
             drift_north_mps: 2.0,
             drift_east_mps: 0.0,
         },
+        None,
     )
     .await;
     assert!(
