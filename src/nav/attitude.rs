@@ -128,10 +128,13 @@ impl Madgwick {
     /// never touches the accelerometer), so a bad estimate can only weaken the
     /// slow gravity correction — it can never inject motion into the attitude.
     ///
-    /// `lin_accel_body` must be supplied from INERTIAL quantities (gyro ×
-    /// dead-reckoned velocity) — never from GPS — so this cannot couple a
-    /// spoofed GPS velocity into the attitude (and thence into DR). See
-    /// `nav::DeadReckoner::step`.
+    /// `lin_accel_body` is supplied from the gyro × the DEAD-RECKONED velocity
+    /// (see `nav::DeadReckoner::step`), never GPS velocity directly. The DR
+    /// velocity is lightly GPS-blended only in NORMAL and freezes fully
+    /// GPS-independent in Suspicious/Spoofed (when an attack is being confirmed);
+    /// and this term only nudges the slow gravity correction (β-bounded, never
+    /// the gyro path), so a spoofed velocity cannot meaningfully bias the
+    /// attitude before the position residual it also produces trips detection.
     pub fn update_with_lin_accel(
         &mut self,
         accel: &[f32; 3],

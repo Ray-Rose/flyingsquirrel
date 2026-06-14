@@ -530,6 +530,14 @@ const MAX_CENTRIPETAL_MPS2: f32 = 30.0;
 /// `MAX_CENTRIPETAL_MPS2`, preserving direction.
 fn bound_centripetal(a: [f32; 3]) -> [f32; 3] {
     let mag = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt();
+    // Defense in depth: a non-finite estimate (e.g. NaN from a poisoned DR
+    // velocity) would slip through `mag > MAX` (NaN comparisons are false) and
+    // NaN the quaternion in `update_with_lin_accel`. Drop to zero compensation,
+    // the same as no maneuver. Inputs are finite-gated upstream (nav::step), so
+    // this is unreachable today — but the attitude filter must not trust them.
+    if !mag.is_finite() {
+        return [0.0; 3];
+    }
     if mag > MAX_CENTRIPETAL_MPS2 {
         let s = MAX_CENTRIPETAL_MPS2 / mag;
         [a[0] * s, a[1] * s, a[2] * s]
