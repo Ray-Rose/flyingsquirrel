@@ -18,6 +18,12 @@ $NET          = if ($env:NET)           { $env:NET }           else { "fs-sitl-n
 $HOME_LAT     = if ($env:HOME_LAT)      { $env:HOME_LAT }      else { "-35.363261" }
 $HOME_LON     = if ($env:HOME_LON)      { $env:HOME_LON }      else { "149.165230" }
 $GLITCH_M     = if ($env:GLITCH_M)      { $env:GLITCH_M }      else { "400" }
+# Phase 2b: spoof injection mode. relay = wire-level meaconing (default); param =
+# ramp ArduPilot's SIM_GPS_GLITCH so EK3 fuses it (the EKF-laundered path). Param
+# needs a longer detector run to cover setup + clean + ramp + detection.
+$SPOOF_MODE   = if ($env:SPOOF_MODE)        { $env:SPOOF_MODE }        else { "relay" }
+$GLITCH_RAMP  = if ($env:GLITCH_RAMP_SECS)  { $env:GLITCH_RAMP_SECS }  else { "60" }
+$DET_DURATION = if ($env:DETECTOR_DURATION) { $env:DETECTOR_DURATION } else { "180" }
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
@@ -80,7 +86,7 @@ try {
         "--expected-home=$HOME_LAT,$HOME_LON" --max-home-distance-m 5000 `
         --json-log /out/events.jsonl --forensic-dir /out `
         --imu-rate 10 `
-        --duration 180 --log-level info | Out-Null
+        --duration $DET_DURATION --log-level info | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "detector start failed" }
 
     Write-Host "[run] launching harness at $HARNESS_IP (waits for GPS, flies, spoofs, watches)"
@@ -89,6 +95,7 @@ try {
         --sitl tcp:sitl:5760 `
         --det-host $DET_IP --det-port 14551 `
         --glitch-m $GLITCH_M --home-lat $HOME_LAT `
+        --spoof-mode $SPOOF_MODE --glitch-ramp-secs $GLITCH_RAMP `
         --clean-secs 20 --watch-secs 70
     $harnessRc = $LASTEXITCODE
 

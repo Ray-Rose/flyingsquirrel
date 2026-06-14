@@ -8,6 +8,14 @@ name: SITL validation (nightly)
 # Spoofed transition + ActionAcked (so a native-EKF reaction can't pass as a
 # detector success).
 #
+# Runs in a matrix over the spoof-injection mode (fail-fast disabled so the legs
+# are independent):
+#   relay — wire-level meaconing the detector sees directly. Proves the full
+#           detect -> sever -> RTL -> read-back chain against real firmware/timing.
+#   param — ramps ArduPilot's SIM_GPS_GLITCH gradually so EK3 FUSES it; the EKF's
+#           fused output (position + self-consistent velocity) is the EKF-laundered
+#           "smart spoofer" the detector's velocity-aiding lane must catch.
+#
 # This keeps the README's headline "validated end-to-end against ArduPilot SITL"
 # claim continuously re-checked instead of being a one-time manual result. It
 # depends on a third-party SITL image and Docker networking, so it runs on a
@@ -17,20 +25,31 @@ on:
   schedule:
     - cron: "17 7 * * *" # ~07:17 UTC nightly
   workflow_dispatch:
-    inputs:
-      glitch_m:
-        description: "GPS spoof magnitude in meters"
-        required: false
-        default: "400"
 
 permissions:
   contents: read
 
 jobs:
   sitl:
-    name: closed-loop SITL
+    name: closed-loop SITL (${{ matrix.mode }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Wire-level meaconing — the established green leg.
+          - mode: relay
+            glitch_m: "400"
+            ramp_secs: "60"
+            detector_duration: "180"
+          # EKF-laundered gradual ramp — param injection. Smaller glitch + a
+          # gradual ramp so EK3 fuses it; a longer detector run to cover
+          # setup + clean + ramp + detection.
+          - mode: param
+            glitch_m: "300"
+            ramp_secs: "60"
+            detector_duration: "260"
     steps:
       - uses: actions/checkout@v4
 
@@ -39,9 +58,12 @@ jobs:
       - name: Build detector image (flyingsquirrel:sitl)
         run: docker build -f deploy/Dockerfile -t flyingsquirrel:sitl .
 
-      - name: Run closed-loop SITL validation
+      - name: Run closed-loop SITL validation (${{ matrix.mode }})
         env:
-          GLITCH_M: ${{ github.event.inputs.glitch_m || '400' }}
+          SPOOF_MODE: ${{ matrix.mode }}
+          GLITCH_M: ${{ matrix.glitch_m }}
+          GLITCH_RAMP_SECS: ${{ matrix.ramp_secs }}
+          DETECTOR_DURATION: ${{ matrix.detector_duration }}
         run: bash deploy/sitl/run-sitl-validation.sh
 
       # The detector writes forensic dumps 0o600 (owner-only) as a non-root
@@ -58,6 +80,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: sitl-detector-output
+          name: sitl-detector-output-${{ matrix.mode }}
           path: deploy/sitl/last-run/
           if-no-files-found: ignore

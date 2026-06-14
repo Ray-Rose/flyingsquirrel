@@ -33,6 +33,15 @@ HOME_DIR="${HOME_DIR:-353}"
 GLITCH_M="${GLITCH_M:-400}"
 CLEAN_SECS="${CLEAN_SECS:-20}"
 WATCH_SECS="${WATCH_SECS:-70}"
+# Spoof injection mode (Phase 2b). `relay` (default) = wire-level meaconing the
+# detector sees directly — proves detect+sever+RTL+verify against real firmware.
+# `param` = ramp ArduPilot's SIM_GPS_GLITCH gradually so EK3 FUSES it (the
+# EKF-laundered path the velocity-aiding lane must catch). GLITCH_RAMP_SECS sizes
+# the param ramp; param needs a longer detector run (setup+clean+ramp+detect),
+# hence DETECTOR_DURATION.
+SPOOF_MODE="${SPOOF_MODE:-relay}"
+GLITCH_RAMP_SECS="${GLITCH_RAMP_SECS:-60}"
+DETECTOR_DURATION="${DETECTOR_DURATION:-180}"
 
 # Static-IP subnet. `--mav-target` is parsed as a numeric SocketAddr (clap does
 # NOT resolve hostnames), so the detector and harness get fixed IPs rather than
@@ -96,7 +105,7 @@ docker run -d --name fs-detector --network "$NET" --ip "$DET_IP" \
     --expected-home="${HOME_LAT},${HOME_LON}" --max-home-distance-m 5000 \
     --json-log /out/events.jsonl --forensic-dir /out \
     --imu-rate 10 \
-    --duration 180 --log-level info >/dev/null
+    --duration "$DETECTOR_DURATION" --log-level info >/dev/null
 
 echo "[run] launching harness at $HARNESS_IP (waits for GPS, flies, spoofs, watches)"
 set +e
@@ -105,6 +114,7 @@ docker run --rm --name fs-harness --network "$NET" --ip "$HARNESS_IP" \
     --sitl tcp:sitl:5760 \
     --det-host "$DET_IP" --det-port 14551 \
     --glitch-m "$GLITCH_M" --home-lat "$HOME_LAT" \
+    --spoof-mode "$SPOOF_MODE" --glitch-ramp-secs "$GLITCH_RAMP_SECS" \
     --clean-secs "$CLEAN_SECS" --watch-secs "$WATCH_SECS"
 HARNESS_RC=$?
 set -e
@@ -129,6 +139,14 @@ if [[ -f "$OUT_DIR/events.jsonl" ]]; then
     echo "  Spoofed transition in events.jsonl   : $([[ $DET_SPOOFED -eq 0 ]] && echo yes || echo NO)"
     echo "  detector commanded+verified RTL      : $([[ $DET_RTB -eq 0 ]] && echo yes || echo NO)"
     echo "  RTL read-back ActionAcked (confirmed): $([[ $DET_ACKED -eq 0 ]] && echo yes || echo 'no (commanded; bare-SITL copter likely disarmed on landing before the dwell)')"
+    # Phase 2b evidence (informative, not gated): in param mode the EKF fuses the
+    # ramp, so detection should come via the velocity-aiding lane (the
+    # consistent-velocity / EKF-laundered catch) rather than a raw position jump.
+    if grep -q 'VelocityAiding' "$OUT_DIR/events.jsonl"; then
+        echo "  velocity-aiding lane fired           : yes (EKF-laundered consistent-velocity catch)"
+    else
+        echo "  velocity-aiding lane fired           : no (caught by a position/velocity-mismatch lane)"
+    fi
 else
     echo "  events.jsonl not found at $OUT_DIR (detector may not have armed)"
 fi

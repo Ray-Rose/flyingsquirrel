@@ -125,6 +125,15 @@ class Relay:
         self.spoof_active = False
         self.spoof_dlat_deg = 0.0
         self.spoof_dlon_deg = 0.0
+        # Latest EKF_STATUS_REPORT (ArduPilot streams it once data streams are
+        # requested). The param-mode evidence: whether EK3 FUSED the gradual
+        # SIM_GPS_GLITCH ramp (GPS_GLITCHING clear, POS_HORIZ_ABS set) rather than
+        # innovation-gating it, and whether the detector's GPS sever later makes
+        # the EKF drop its absolute-position lane (POS_HORIZ_ABS clears /
+        # CONST_POS_MODE sets).
+        self.ekf_flags = None
+        self.ekf_vel_var = None
+        self.ekf_pos_horiz_var = None
 
     def _maybe_spoof_and_serialize(self, msg, mt):
         """Return the bytes to forward for `msg`. When the spoof is armed and
@@ -180,6 +189,10 @@ class Relay:
                     self.gps_sats = msg.satellites_visible
                 elif mt == "GLOBAL_POSITION_INT":
                     self.rel_alt_m = msg.relative_alt / 1000.0
+                elif mt == "EKF_STATUS_REPORT":
+                    self.ekf_flags = msg.flags
+                    self.ekf_vel_var = msg.velocity_variance
+                    self.ekf_pos_horiz_var = msg.pos_horiz_variance
                 # Forward to the detector — spoofing the position en route if armed.
                 buf = self._maybe_spoof_and_serialize(msg, mt)
                 if buf:
@@ -244,6 +257,23 @@ class Relay:
             name.encode("ascii"), float(value),
             mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
 
+    def ekf_summary(self):
+        """Human-readable EKF_STATUS_REPORT snapshot. Flag bits are the stable
+        MAVLink EKF_STATUS_FLAGS enum: POS_HORIZ_ABS=16 (absolute horizontal
+        position — GPS-aided), CONST_POS_MODE=128 (no position aiding, set when
+        GPS is dropped), GPS_GLITCHING=32768 (innovation gate tripped — a jump
+        the EKF REJECTED rather than fused). For a fused gradual ramp expect
+        pos_horiz_abs=True + gps_glitching=False; after the sever expect
+        pos_horiz_abs to clear / const_pos_mode to set."""
+        if self.ekf_flags is None:
+            return "EKF_STATUS not yet seen"
+        f = self.ekf_flags
+        return (
+            "EKF flags=0x{:04x} pos_horiz_abs={} const_pos_mode={} gps_glitching={} "
+            "| vel_var={:.2f} pos_horiz_var={:.2f}".format(
+                f, bool(f & 16), bool(f & 128), bool(f & 32768),
+                self.ekf_vel_var or 0.0, self.ekf_pos_horiz_var or 0.0))
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -266,11 +296,28 @@ def main():
     # stream (vehicle-agnostic; the only path that works for PX4). `param`
     # spoofs ArduPilot's simulated GPS via SIM_GPS_GLITCH_Y.
     ap.add_argument("--spoof-mode", choices=["relay", "param"], default="relay")
+    # PARAM-MODE ramp duration. A STEP SIM_GPS_GLITCH is innovation-gated by
+    # ArduPilot's EK3 (rejected — proves nothing); ramping it gradually over this
+    # many seconds keeps each epoch's position jump under the gate so the EKF
+    # FUSES it — the realistic "smart spoofer" / EKF-laundered ramp whose fused
+    # output the detector's velocity-aiding lane must catch. Ignored in relay mode.
+    ap.add_argument("--glitch-ramp-secs", type=float, default=60.0)
     # Autopilot family — affects only the GUIDED-mode number used to arm.
     # ArduCopter GUIDED = custom_mode 4; PX4 doesn't use that path (we just
     # arm + let it hold), so the value is harmless there.
     ap.add_argument("--vehicle", choices=["ardu-copter", "px4"], default="ardu-copter")
     args = ap.parse_args()
+
+    # Param mode needs the watch window to outlast the ramp plus a detection
+    # margin, or the loop tears down before the EKF-fused offset grows enough to
+    # detect. Auto-extend so callers don't have to keep --watch-secs in sync with
+    # --glitch-ramp-secs.
+    if args.spoof_mode == "param":
+        needed = args.glitch_ramp_secs + 45.0
+        if args.watch_secs < needed:
+            log("param mode: extending --watch-secs {:.0f} -> {:.0f} to cover the "
+                "ramp + detection".format(args.watch_secs, needed))
+            args.watch_secs = needed
 
     r = Relay(args.sitl, args.det_host, args.det_port)
     r.start()
@@ -353,27 +400,30 @@ def main():
     lat_rad = math.radians(args.home_lat)
     dlon_deg = args.glitch_m / (111320.0 * max(math.cos(lat_rad), 1e-6))
 
-    if args.spoof_mode == "relay":
+    param_mode = args.spoof_mode == "param"
+    if not param_mode:
         # Wire-level meaconing: the relay rewrites the lat/lon of every GPS
         # message it forwards to the detector. Vehicle-agnostic — works
         # identically for PX4 and ArduPilot, no simulator GPS-glitch param
         # needed (PX4 has no clean equivalent). Models the attack the detector
         # exists to catch: the position the companion sees is offset from truth.
+        # Applied as a step here.
         log("INJECTING SPOOF (relay wire-level): +{:.6f} deg lon (~{} m east at lat {})".format(
             dlon_deg, args.glitch_m, args.home_lat))
         r.spoof_dlat_deg = 0.0
         r.spoof_dlon_deg = dlon_deg
         r.spoof_active = True
     else:
-        # SITL-param injection (ArduPilot only): spoof the autopilot's OWN
-        # simulated GPS receiver. Param is SIM_GPS_GLITCH_{X,Y,Z} in DEGREES
-        # (verified against ArduPilot SIM_GPS.cpp); X=lat Y=lon Z=alt. Set both
-        # the flat (this image) and instance (newer master) names; the
-        # nonexistent one is ignored.
-        log("INJECTING SPOOF (SITL param): SIM_GPS_GLITCH_Y = {:.6f} deg (~{} m east)".format(
-            dlon_deg, args.glitch_m))
-        for name in ("SIM_GPS_GLITCH_Y", "SIM_GPS1_GLTCH_Y"):
-            r.set_param(name, dlon_deg)
+        # SITL-param injection (ArduPilot only): bias the autopilot's OWN
+        # simulated GPS receiver via SIM_GPS_GLITCH_Y (DEGREES; verified against
+        # ArduPilot SIM_GPS.cpp). A STEP is innovation-gated by EK3 (rejected),
+        # so we RAMP it in the watch loop below over --glitch-ramp-secs: each
+        # epoch's jump stays under the gate and the EKF FUSES the offset. This is
+        # the EKF-laundered "smart spoofer" whose fused output (position AND a
+        # self-consistent velocity) the detector's velocity-aiding lane must
+        # catch — the part the relay/wire path does NOT exercise.
+        log("INJECTING SPOOF (SITL param, gradual ramp over {:.0f}s to ~{} m east). "
+            "Pre-injection {}".format(args.glitch_ramp_secs, args.glitch_m, r.ekf_summary()))
 
     log("watching {} s for detector-driven RTL ({})...".format(args.watch_secs, args.vehicle))
     spoof_t = time.time()
@@ -381,20 +431,39 @@ def main():
     grace = args.verify_grace_secs
     reached_rtl = False
     rtl_at = None
+    glitch_full = False
+    last_ekf_log = 0.0
     # After the autopilot reaches RTL, KEEP the relay running for `grace` more
     # seconds. The detector confirms RTL via a read-back DWELL (several fresh
     # HEARTBEATs observed in RTL mode), and those heartbeats only reach it
     # THROUGH this relay. The old code tore down on the first RTL heartbeat,
-    # starving the dwell, so the detector never emitted ActionAcked — which made
-    # run-sitl-validation.sh's ActionAcked assertion fail even though the full
-    # detect->sever->RTL chain worked.
+    # starving the dwell, so the detector never emitted ActionAcked.
     while True:
         now = time.time()
+        # PARAM-MODE: ramp SIM_GPS_GLITCH_Y so EK3 fuses it instead of gating it.
+        # Set both the flat (this image) and instance (newer master) param names;
+        # the nonexistent one is ignored.
+        if param_mode and not glitch_full:
+            frac = (now - spoof_t) / max(args.glitch_ramp_secs, 0.1)
+            if frac >= 1.0:
+                frac = 1.0
+                glitch_full = True
+            target = frac * dlon_deg
+            for name in ("SIM_GPS_GLITCH_Y", "SIM_GPS1_GLTCH_Y"):
+                r.set_param(name, target)
+        # Periodic EKF-status evidence: did the EKF FUSE the ramp (pos_horiz_abs
+        # set, gps_glitching clear)? After the detector severs GPS, does the EKF
+        # drop its absolute-position lane (pos_horiz_abs clears)?
+        if now - last_ekf_log >= 5.0:
+            log("  t+{:.0f}s mode={} {}".format(
+                now - spoof_t, MODE_NAMES.get(r.last_mode, "?"), r.ekf_summary()))
+            last_ekf_log = now
         if rtl_at is None and is_rtl_equiv(args.vehicle, r.last_mode):
             rtl_at = now
             reached_rtl = True
             log("autopilot reached RTL-equivalent; holding the relay {:.0f}s so the "
-                "detector's RTL read-back dwell completes (ActionAcked)".format(grace))
+                "detector's RTL read-back dwell completes (ActionAcked). {}".format(
+                    grace, r.ekf_summary()))
         if rtl_at is not None and now - rtl_at >= grace:
             break
         if rtl_at is None and now >= end:
@@ -402,7 +471,8 @@ def main():
         time.sleep(0.5)
 
     final = r.last_mode
-    log("final mode = {} ({})".format(final, MODE_NAMES.get(final, "?")))
+    log("final mode = {} ({}) | {}".format(
+        final, MODE_NAMES.get(final, "?"), r.ekf_summary()))
     log("fwd SITL->det={} det->SITL={}".format(r._fwd_to_det, r._fwd_to_sitl))
     r.stop()
 

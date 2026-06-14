@@ -35,12 +35,17 @@
 > position-offset attack *as the companion computer sees it*, and exercises the
 > entire detection → sever → RTL → read-back path against real firmware and real
 > MAVLink timing. It does **not** route the offset through ArduPilot's **EKF**, so
-> it does not yet prove the detector catches a spoof *after the autopilot's own
-> estimator has fused (and possibly rate-limited or rejected) it*. That
-> EKF-efficacy proof is the harness's `--spoof-mode param` path (a gradual
-> `SIM_GPS_GLITCH_*` ramp the EKF will fuse, observed via `EKF_STATUS_REPORT`) and
-> is the **Phase 2 validation gap** — implemented in the harness but not yet wired
-> into CI.
+> it does not by itself prove the detector catches a spoof *after the autopilot's
+> own estimator has fused (and possibly rate-limited or rejected) it*. That
+> EKF-efficacy proof is the harness's `--spoof-mode param` path: it ramps
+> `SIM_GPS_GLITCH_*` gradually so ArduPilot's EK3 FUSES the offset (a step is
+> innovation-gated), logs `EKF_STATUS_REPORT` as evidence the EKF fused it (and
+> later dropped its GPS lane on the sever), and relies on the detector's
+> velocity-aiding lane to catch the EKF-laundered consistent-velocity output. As
+> of SITL **Phase 2b** this is wired as a second CI matrix leg
+> (`SPOOF_MODE=param` in [`sitl.yml`](../.github/workflows/sitl.yml), independent
+> of the relay leg via `fail-fast: false`); its first green run is the pending
+> milestone.
 >
 > ### Bugs this validation found and fixed (invisible to `mavsim`)
 > The whole point of testing against real firmware: `mavsim` was circular (it
