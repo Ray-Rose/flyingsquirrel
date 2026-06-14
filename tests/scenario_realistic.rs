@@ -6,24 +6,23 @@
 //! rate test. These run CLEAN flights (no spoof injected, so any detection is a
 //! FALSE ALARM) and sweep the IMU error model.
 //!
-//! Established empirically by the tests below:
+//! Status (after the adaptive per-axis CUSUM — step 1 of the false-latch fix):
 //!   * Logic is sound at low noise — `low_noise_clean_flight_holds` PASSES.
-//!   * **Realistic IMU noise alone false-fires** (`realistic_*`, `#[ignore]`d):
-//!     at consumer-MEMS σ (accel 0.03 m/s², gyro 0.002 rad/s), the dead-reckoned
-//!     position random-walks ~10 m over 90 s. Because the residual is GPS minus
-//!     the cumulative-since-anchor DR position, that wander is a PERSISTENT
-//!     offset (not zero-mean), so the per-axis CUSUM ramps and latches Spoofed —
-//!     i.e. it would sever GPS and RTL a perfectly healthy drone. A persistent
-//!     accel bias and a sustained coordinated turn make it worse/faster.
-//!
-//! Root cause + fix: the cumulative-residual-since-anchor design treats honest
-//! DR drift the same as a slow spoof. The fix is a sliding-window residual
-//! (compare GPS-vs-DR DISPLACEMENT over a short window, which differences out
-//! the accumulated DR error) and/or in-flight accel-bias estimation + GPS-aided
-//! attitude for the turn case. This is a deliberate, separately-validated
-//! redesign — see docs/threats.md. These `#[ignore]`d tests stay executable so
-//! that fix can be validated by flipping their assertions. Run the
-//! characterizations with: `cargo test --test scenario_realistic -- --ignored`.
+//!   * **Realistic noise / bias on LINEAR flight no longer false-fire**
+//!     (`realistic_noise_does_not_false_fire`, `realistic_bias_does_not_false_fire`
+//!     — promoted from the `#[ignore]`d characterizations). The OLD fixed per-axis
+//!     k (0.4σ at σ=2.5 m) ramped on pure GPS noise plus the bounded DR
+//!     random-walk; the adaptive per-axis `eff_k` (≈2σ, learned only while the
+//!     axis is quiescent — see drift.rs) tolerates both. They now produce the
+//!     SAME clean result as the low-noise baseline (events=3, no drift/jump).
+//!   * **A sustained coordinated turn STILL false-fires**
+//!     (`sustained_turn_false_fires_known_limitation`, still `#[ignore]`d): the
+//!     centripetal specific force tilts the Madgwick attitude (~6°), coupling
+//!     through gravity compensation into a ~90 m DR residual that no adaptive
+//!     threshold should (or does) absorb. The fix is GPS-aided attitude (subtract
+//!     the GPS-derived centripetal) — step 3, a separate validated pass. See
+//!     docs/threats.md. Run the remaining characterization with:
+//!     `cargo test --test scenario_realistic -- --ignored`.
 
 mod common;
 
@@ -138,14 +137,18 @@ async fn low_noise_clean_flight_holds() {
     );
 }
 
-/// KNOWN LIMITATION: realistic consumer-MEMS NOISE alone (no bias) false-fires.
+/// REGRESSION (promoted from a known limitation, fixed by the adaptive per-axis
+/// CUSUM): realistic consumer-MEMS NOISE alone (no bias) on a linear flight must
+/// NOT false-fire. The old fixed per-axis k (0.4σ at σ=2.5 m) ramped on pure GPS
+/// noise plus the bounded DR random-walk; the adaptive `eff_k` (≈2σ, learned
+/// only while quiescent) tolerates both. Same clean result as the low-noise
+/// baseline.
 #[tokio::test(start_paused = true)]
-#[ignore = "documents an unfixed limitation: realistic IMU noise false-fires (needs sliding-window residual)"]
-async fn realistic_noise_false_fires_known_limitation() {
+async fn realistic_noise_does_not_false_fire() {
     let events = run_clean_flight(
         LinearNorth { speed_mps: 8.0 },
         90,
-        2.5, // realistic GPS σ — by itself enough to ramp the fixed-k per-axis CUSUM
+        2.5, // realistic GPS σ — enough to ramp the OLD fixed-k per-axis CUSUM
         0.03,
         0.002,
         [0.0; 3],
@@ -154,16 +157,18 @@ async fn realistic_noise_false_fires_known_limitation() {
     )
     .await;
     assert!(
-        spoofed("realistic-noise", &events),
-        "EXPECTED-FAIL: if realistic IMU noise no longer false-fires, the robustness \
-         limitation is fixed — update docs/threats.md and promote this test."
+        !spoofed("realistic-noise", &events),
+        "realistic IMU noise on a linear flight must NOT false-latch Spoofed \
+         (adaptive per-axis CUSUM, step 1)"
     );
 }
 
-/// KNOWN LIMITATION: a persistent accel + gyro bias makes the false-fire faster.
+/// REGRESSION (promoted): a persistent accel + gyro bias on a linear flight must
+/// also NOT false-fire. The adaptive per-axis `eff_k` absorbs the bias-induced
+/// per-fix residual scale the same way it absorbs noise; the bounded cumulative
+/// excursion over 90 s no longer ramps the CUSUM.
 #[tokio::test(start_paused = true)]
-#[ignore = "documents an unfixed limitation: realistic IMU bias false-fires (needs bias est / sliding-window residual)"]
-async fn realistic_bias_false_fires_known_limitation() {
+async fn realistic_bias_does_not_false_fire() {
     let events = run_clean_flight(
         LinearNorth { speed_mps: 8.0 },
         90,
@@ -176,14 +181,17 @@ async fn realistic_bias_false_fires_known_limitation() {
     )
     .await;
     assert!(
-        spoofed("realistic-bias", &events),
-        "EXPECTED-FAIL: see docs/threats.md (cumulative-residual drift limitation)."
+        !spoofed("realistic-bias", &events),
+        "realistic IMU bias on a linear flight must NOT false-latch Spoofed \
+         (adaptive per-axis CUSUM, step 1)"
     );
 }
 
-/// KNOWN LIMITATION: a sustained coordinated turn false-fires worst — the
-/// centripetal specific force tilts the Madgwick attitude (~6°), coupling
-/// through gravity compensation into a large DR residual (~60 m).
+/// KNOWN LIMITATION (still unfixed after step 1 — needs GPS-aided attitude):
+/// a sustained coordinated turn false-fires worst — the centripetal specific
+/// force tilts the Madgwick attitude (~6°), coupling through gravity
+/// compensation into a large DR residual (~90 m measured). The adaptive
+/// per-axis k does NOT (and should not) absorb a residual this large.
 #[tokio::test(start_paused = true)]
 #[ignore = "documents an unfixed limitation: sustained turns false-fire (needs GPS-aided attitude)"]
 async fn sustained_turn_false_fires_known_limitation() {

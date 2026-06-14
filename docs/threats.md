@@ -358,46 +358,59 @@ All `cargo test` (114 lib + 9 property + integration), `cargo clippy
 | **P3-SITLCI** | 🟢 | **Fixed (S-04).** SITL validation was manual-only. Added `.github/workflows/sitl.yml` — a nightly + on-demand job that builds the detector image, runs `deploy/sitl/run-sitl-validation.sh` (closed-loop ArduPilot SITL), gates on the detector's own event log (Spoofed + ActionAcked), and uploads the event log/forensic dumps. Best-effort (third-party SITL image + Docker networking), so it's NOT a per-push gate. |
 | **P3-PX4** | 🟡 | **Detector side done + documented; live run pending environment.** PX4 support (sever param, packed-mode RTL, autopilot cross-check) is implemented and unit-tested (Phase 1), and the manual PX4 SITL run is documented (`docs/sitl.md` §"Running against PX4 SITL", with a precise status callout). NOT done: a containerized one-command PX4 harness + an actual end-to-end PX4 SITL run — PX4's Gazebo/jMAVSim stack differs from ArduPilot's and can't be exercised from the Windows dev box. This is the standing **PX4 SITL milestone**. |
 
-#### 🔴 CRITICAL KNOWN LIMITATION — false alarms under realistic sensor error
+#### 🟠 PARTIALLY FIXED — false alarms under realistic sensor error
 
-A new realistic-noise harness (`tests/scenario_realistic.rs`, + accel-bias and a
-`CircleHorizontal` turning trajectory added to the sim) **empirically proves the
-detector false-latches `Spoofed` — i.e. severs GPS and commands RTL on a
-perfectly healthy drone — under realistic conditions.** The existing integration
-scenarios pass only because they use ~10× cleaner GPS (σ=0.3 m) and ~30× cleaner
-IMU noise than reality. Three compounding causes, each an `#[ignore]`d
-characterization test that flips to passing once fixed:
+A realistic-noise harness (`tests/scenario_realistic.rs`, + accel-bias and a
+`CircleHorizontal` turning trajectory in the sim) characterized a detector
+false-latch: under realistic sensor error the detector could sever GPS and
+command RTL on a perfectly healthy drone. The existing integration scenarios
+pass only because they use ~10× cleaner GPS (σ=0.3 m) and ~30× cleaner IMU noise
+than reality. Three compounding causes were identified; **step 1 (the adaptive
+per-axis CUSUM) is now landed and cleared the two linear-flight cases:**
 
-1. **Per-axis CUSUM is not adaptive** (audit B-? / nav-review #2). The per-axis
-   drift `k` is fixed at 1.0 m while only the *magnitude* lane learns its noise
-   floor. At realistic GPS σ=2.5 m the per-axis CUSUM ramps on honest noise and
-   false-fires within ~90 s even with a near-perfect IMU. **Fix:** drive per-axis
-   `k`/`h` from an online per-axis residual-σ EWMA, mirroring the magnitude lane.
-2. **DR drift vs the cumulative-since-anchor residual** (nav-review #3). Realistic
-   IMU noise/bias random-walks the dead-reckoned position; because the residual is
-   GPS minus the *never-re-anchored* DR position, that wander is a persistent
-   offset the CUSUM reads as slow drift. **Fix:** a sliding-window residual
-   (compare GPS-vs-DR *displacement* over a short window, differencing out
-   accumulated DR error) and/or in-flight accel-bias estimation.
-3. **Centripetal attitude coupling** (nav-review #4). In a sustained coordinated
-   turn the centripetal specific force tilts the Madgwick "down" (~6°), coupling
-   through gravity compensation into a ~60 m residual. (Gating the accel
-   correction off during turns was tried and is WRONG — it removes the gravity
-   reference and lets gyro bias diverge the attitude far worse.) **Fix:** GPS-aided
-   attitude — subtract the GPS-velocity-derived centripetal acceleration before
-   the accel correction.
+1. **Per-axis CUSUM is not adaptive — ✅ FIXED (step 1).** The per-axis drift `k`
+   was fixed at 1.0 m (0.4σ at GPS σ=2.5 m) while only the *magnitude* lane learned
+   its noise floor, so the per-axis CUSUM ramped on honest noise (~29 false fires /
+   30k fixes, `per_axis_no_false_alarm_on_realistic_gps_noise`). Fixed in
+   `detect/drift.rs`: per-axis `eff_k = max(cusum_k_m, axis_noise × 2.5)` where
+   `axis_noise` is an online `|rn|`/`|re|` EWMA, learned during a warmup then
+   updated ONLY while that axis's CUSUMs are quiescent — so an in-progress drift
+   can't inflate the floor and absorb its own signal (the missed-detection trap).
+   Mirrors the B-02 magnitude lane.
+2. **DR drift vs the cumulative-since-anchor residual — ✅ no longer false-fires on
+   LINEAR flight (step 1); sliding-window residual still advisable (step 2).**
+   Realistic IMU noise/bias random-walks the never-re-anchored DR position, and the
+   residual reads that wander as a persistent offset. On the 90 s linear
+   characterizations the adaptive per-axis `eff_k` (≈2σ) also tolerates this
+   *bounded* excursion: `realistic_noise_does_not_false_fire` and
+   `realistic_bias_does_not_false_fire` now produce the same clean result as the
+   low-noise baseline and are PROMOTED (no longer `#[ignore]`d). The principled
+   fix — a sliding-window residual (GPS-vs-DR *displacement* over a window) and/or
+   in-flight accel-bias estimation — remains the recommended **step 2** for
+   robustness on longer / more-dynamic flights where unbounded cumulative drift
+   could still exceed the adaptive floor.
+3. **Centripetal attitude coupling — 🔴 STILL UNFIXED (step 3).** In a sustained
+   coordinated turn the centripetal specific force tilts the Madgwick "down" (~6°),
+   coupling through gravity compensation into a ~90 m residual that no adaptive
+   threshold should (or does) absorb — `sustained_turn_false_fires_known_limitation`
+   still false-latches and stays `#[ignore]`d. (Gating the accel correction off
+   during turns was tried and is WRONG — it removes the gravity reference and lets
+   gyro bias diverge the attitude far worse.) **Fix:** GPS-aided attitude — subtract
+   the GPS-velocity-derived centripetal acceleration before the accel correction.
 
-**This is a pre-real-flight blocker and the single highest-priority follow-up.**
-It does not affect the v0.1.0 release pipeline or the other defenses, but the
-detector must NOT be flown against a real GPS/IMU until at least (1) and (2) are
-fixed and re-validated. The fixes are deliberately deferred to a dedicated,
-separately-validated pass: they are safety-critical detection-math changes where
-a careless threshold change would cause MISSED detections (worse than false
-alarms), so they must not be rushed.
+**Still a pre-real-flight blocker until step 3 lands:** a healthy drone in a
+sustained coordinated turn would still be false-latched. Step 1 is a localized,
+separately-validated change to `detect/drift.rs` with the full attack-regression
+suite green — no desensitization (`per_axis_real_drift_still_fires_after_learning_noisy_floor`
+plus every `scenario_*` attack test pass). The remaining steps stay deliberately
+deferred to dedicated, separately-validated passes: they are safety-critical
+detection-math changes where a careless change would cause MISSED detections
+(worse than false alarms).
 
-All non-ignored `cargo test`, `cargo clippy --all-targets -D warnings`, and
-`cargo fmt --all --check` stay green (the realistic false-alarms are `#[ignore]`d
-characterizations, run with `cargo test --test scenario_realistic -- --ignored`).
+All `cargo test` (incl. the promoted regressions), `cargo clippy --all-targets
+-D warnings`, and `cargo fmt --all --check` are green; the one remaining
+characterization is `#[ignore]`d (run with `cargo test --test scenario_realistic
+-- --ignored`).
 
 ---
 
