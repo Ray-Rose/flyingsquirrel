@@ -21,30 +21,38 @@ pub const ARDUCOPTER_MODE_RTL: u32 = 6;
 pub const ARDUCOPTER_MODE_SMART_RTL: u32 = 21;
 pub const ARDUCOPTER_MODE_LAND: u32 = 9; // also acceptable as "the autopilot got the message"
 
-/// PX4 mode encoding uses two bytes packed into custom_mode:
-///   bits 31..24 = `main_mode` (e.g. AUTO=4, POSCTL=3, MANUAL=1)
-///   bits 23..16 = `sub_mode`  (within AUTO: TAKEOFF=2, LOITER=3, MISSION=4,
+/// PX4 mode encoding (the `px4_custom_mode` union) packs two bytes into
+/// `custom_mode`:
+///   bits 23..16 = `main_mode` (e.g. AUTO=4, POSCTL=3, MANUAL=1)
+///   bits 31..24 = `sub_mode`  (within AUTO: TAKEOFF=2, LOITER=3, MISSION=4,
 ///                              RTL=5, LAND=6, RTGS=7, FOLLOW_TARGET=8)
 ///   bits 15..0  = reserved
 ///
 /// "RTL engaged" for PX4 = `main_mode=AUTO` AND `sub_mode ∈ {RTL, LAND, RTGS}`.
-/// Source: PX4 Firmware `src/modules/commander/px4_custom_mode.h`.
+/// Source: PX4 Firmware `src/modules/commander/px4_custom_mode.h` (the union is
+/// little-endian: `main_mode` is byte 2, `sub_mode` byte 3). VERIFIED against
+/// live PX4 SITL wire values — AUTO.LOITER=0x03040000, AUTO.TAKEOFF=0x02040000,
+/// AUTO.RTL=0x05040000. (A prior version had main/sub byte positions SWAPPED;
+/// the self-consistent round-trip unit test couldn't see it, but a real PX4 SITL
+/// RTL then read as a non-AUTO mode and verification reported ActionUnconfirmed
+/// even though PX4 had reached AUTO.RTL.)
 pub const PX4_MAIN_MODE_AUTO: u8 = 4;
 pub const PX4_SUB_MODE_AUTO_RTL: u8 = 5;
 pub const PX4_SUB_MODE_AUTO_LAND: u8 = 6;
 pub const PX4_SUB_MODE_AUTO_RTGS: u8 = 7;
 
-/// Extract (main, sub) from a PX4 `custom_mode` value.
+/// Extract (main, sub) from a PX4 `custom_mode` value. `main_mode` is bits
+/// 16..23, `sub_mode` is bits 24..31 (PX4's `px4_custom_mode` union).
 pub fn px4_split_mode(custom_mode: u32) -> (u8, u8) {
-    let main = ((custom_mode >> 24) & 0xFF) as u8;
-    let sub = ((custom_mode >> 16) & 0xFF) as u8;
+    let main = ((custom_mode >> 16) & 0xFF) as u8;
+    let sub = ((custom_mode >> 24) & 0xFF) as u8;
     (main, sub)
 }
 
 /// Encode a PX4 (main, sub) pair into a 32-bit `custom_mode`. Inverse of
 /// `px4_split_mode` (the low 16 bits are reserved → zero).
 pub fn px4_encode_mode(main: u8, sub: u8) -> u32 {
-    ((main as u32) << 24) | ((sub as u32) << 16)
+    ((sub as u32) << 24) | ((main as u32) << 16)
 }
 
 /// Supported autopilot family. The verifier uses this to:
@@ -615,6 +623,30 @@ mod tests {
         // ArduCopter RTL=6 has all bits in the low byte; PX4 decoder reads
         // main from the HIGH byte (0) → not AUTO → not RTL. Good.
         assert!(!is_rtl_mode(p, ARDUCOPTER_MODE_RTL));
+    }
+
+    #[test]
+    fn px4_split_mode_matches_real_sitl_wire_values() {
+        // Pinned to ACTUAL custom_mode values observed on the wire from live PX4
+        // SITL (jonasvautherin/px4-gazebo-headless). PX4 packs main_mode in bits
+        // 16..23 and sub_mode in bits 24..31; the self-consistent round-trip test
+        // can't catch a swapped decode, but these literals can — and would have
+        // caught the bug the first live PX4 closed-loop run exposed (PX4 reached
+        // AUTO.RTL = 0x05040000 but the swapped decoder read it as non-AUTO, so
+        // verification reported ActionUnconfirmed though PX4 had RTL'd).
+        assert_eq!(px4_split_mode(0x0304_0000), (PX4_MAIN_MODE_AUTO, 3)); // AUTO.LOITER (idle)
+        assert_eq!(px4_split_mode(0x0204_0000), (PX4_MAIN_MODE_AUTO, 2)); // AUTO.TAKEOFF
+        assert_eq!(
+            px4_split_mode(0x0504_0000),
+            (PX4_MAIN_MODE_AUTO, PX4_SUB_MODE_AUTO_RTL)
+        ); // AUTO.RTL
+           // The decisive end-to-end check: PX4's real AUTO.RTL wire value MUST read
+           // as RTL, and the encoder MUST reproduce that exact value.
+        assert!(is_rtl_mode(VehicleProfile::Px4, 0x0504_0000));
+        assert_eq!(
+            px4_encode_mode(PX4_MAIN_MODE_AUTO, PX4_SUB_MODE_AUTO_RTL),
+            0x0504_0000
+        );
     }
 
     #[test]

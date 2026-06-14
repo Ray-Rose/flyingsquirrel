@@ -44,9 +44,10 @@ MODE_NAMES = {0: "STABILIZE", 2: "ALT_HOLD", 3: "AUTO", 4: "GUIDED",
 # ArduCopter flat custom_mode values that count as "no longer GPS-navigating".
 ARDU_RTL_EQUIV = {6, 9, 21}  # RTL, LAND, SMART_RTL
 
-# PX4 packs custom_mode as (main_mode<<24)|(sub_mode<<16). AUTO main=4; the
-# return/land sub-modes are RTL=5, LAND=6, RTGS=7 — these are PX4's
-# "no longer GPS-navigating" states, matching the detector's is_rtl_mode(px4).
+# PX4 packs custom_mode as (sub_mode<<24)|(main_mode<<16) — main_mode in bits
+# 16..23, sub_mode in bits 24..31 (the px4_custom_mode union). AUTO main=4; the
+# return/land sub-modes are RTL=5, LAND=6, RTGS=7 — these are PX4's "no longer
+# GPS-navigating" states. VERIFIED against live PX4 SITL: AUTO.RTL = 0x05040000.
 PX4_MAIN_AUTO = 4
 PX4_AUTO_RTL_SUBS = {5, 6, 7}
 
@@ -58,8 +59,8 @@ def is_rtl_equiv(vehicle, custom_mode):
     if custom_mode is None:
         return False
     if vehicle == "px4":
-        main = (custom_mode >> 24) & 0xFF
-        sub = (custom_mode >> 16) & 0xFF
+        main = (custom_mode >> 16) & 0xFF
+        sub = (custom_mode >> 24) & 0xFF
         return main == PX4_MAIN_AUTO and sub in PX4_AUTO_RTL_SUBS
     return custom_mode in ARDU_RTL_EQUIV
 
