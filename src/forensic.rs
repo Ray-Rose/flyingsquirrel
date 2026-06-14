@@ -221,6 +221,29 @@ impl ForensicBuffer {
         self.dump_fired.load(Ordering::Acquire)
     }
 
+    /// Atomically CLAIM the one-shot dump slot. Returns `true` if THIS caller
+    /// won the claim (and must perform the write), `false` if a dump was
+    /// already claimed/written this process lifetime.
+    ///
+    /// Replaces a check-then-act on `already_dumped()`: the claim and the flip
+    /// are a single compare_exchange, so two near-simultaneous Spoofed
+    /// transitions — e.g. a re-spoof right after an operator reset while the
+    /// first dump's async write is still in flight — cannot both spawn a write
+    /// (which would collide on the 1-second-resolution filename). The winner
+    /// calls `release_dump_claim()` if its write fails, so a transient I/O
+    /// error still allows a later retry.
+    pub fn try_claim_dump(&self) -> bool {
+        self.dump_fired
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Release a dump claim won via `try_claim_dump()` after a FAILED write,
+    /// re-arming the buffer so a later Spoofed transition can retry.
+    pub fn release_dump_claim(&self) {
+        self.dump_fired.store(false, Ordering::Release);
+    }
+
     pub fn push_gps(&mut self, t_secs: f64, fix: &GpsFix) {
         self.gps.push_back(GpsFixRecord::from((t_secs, fix)));
         self.trim_gps(t_secs);
@@ -517,6 +540,25 @@ mod tests {
         assert!(
             b.already_dumped(),
             "flag mutation must be visible via the buffer"
+        );
+    }
+
+    #[test]
+    fn try_claim_dump_is_exclusive_and_releasable() {
+        let b = ForensicBuffer::new(5.0, 100.0);
+        // First claim wins; a second concurrent claim loses — only one writer.
+        assert!(b.try_claim_dump(), "first claim must win");
+        assert!(
+            !b.try_claim_dump(),
+            "second claim must lose (no double dump)"
+        );
+        assert!(b.already_dumped());
+        // A failed write releases the claim and re-arms a retry.
+        b.release_dump_claim();
+        assert!(!b.already_dumped());
+        assert!(
+            b.try_claim_dump(),
+            "claim must be re-winnable after release"
         );
     }
 }

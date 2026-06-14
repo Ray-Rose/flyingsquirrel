@@ -144,6 +144,29 @@ impl FusionConfig {
                 n.static_init_s
             ));
         }
+        // The boot-anchor (meaconing-at-boot) radius. A NaN/Inf/non-positive
+        // value makes `is_first_fix_plausible` accept ANY first fix — silently
+        // disabling the defense while startup still logs the cross-check as
+        // ARMED. Same failure class as the forensic.window_s gate (F-03); the
+        // central validation pass simply missed this sibling field. The upper
+        // cap rejects an effectively-infinite finite radius (e.g. 1e308 from a
+        // fat-fingered exponent) that is_finite() alone would pass.
+        if !(n.max_home_distance_m > 0.0 && n.max_home_distance_m.is_finite()) {
+            return Err(format!(
+                "nav.max_home_distance_m must be > 0 and finite (got {}); a NaN/Inf or \
+                 non-positive radius silently disables the boot-anchor check while it \
+                 still logs as ARMED",
+                n.max_home_distance_m
+            ));
+        }
+        if n.max_home_distance_m > 1.0e6 {
+            return Err(format!(
+                "nav.max_home_distance_m must be <= 1_000_000 m (got {}); a radius larger \
+                 than ~1000 km is almost certainly a typo and effectively disables the \
+                 boot-anchor check",
+                n.max_home_distance_m
+            ));
+        }
         Ok(())
     }
 }
@@ -476,7 +499,14 @@ impl Fusion {
             return; // forensic not configured
         };
         let timestamp = Timestamp::now_mono();
-        if forensic.already_dumped() {
+        // Atomically CLAIM the one-shot dump slot BEFORE doing any work. A plain
+        // already_dumped() load here was check-then-act: a re-spoof right after
+        // an operator reset (while the first dump's async write was still in
+        // flight, so the flag wasn't set yet) could pass the check twice and
+        // spawn two concurrent writes that then collide on the 1-second-
+        // resolution filename. try_claim_dump() folds the check and the flip
+        // into one compare_exchange; the loser emits Suppressed.
+        if !forensic.try_claim_dump() {
             let dup_ev = SpoofingEvent::new(
                 timestamp,
                 SpoofKind::ForensicDumpSuppressed,
@@ -519,9 +549,11 @@ impl Fusion {
         let task = async move {
             match crate::forensic::dump_to_disk(&snap, &dir).await {
                 Ok(path) => {
-                    // Mark fired ONLY on success — a transient write failure
-                    // shouldn't suppress retry on the next Spoofed transition.
-                    fired_flag.store(true, std::sync::atomic::Ordering::Release);
+                    // The dump slot was atomically CLAIMED via try_claim_dump()
+                    // before this task was spawned, so a successful write simply
+                    // keeps it claimed (the once-per-process guarantee). No store
+                    // is needed here — see the Err arm, which RELEASES the claim
+                    // so a transient failure can still retry.
                     let ev = SpoofingEvent::new(
                         Timestamp::now_mono(),
                         SpoofKind::ForensicDumpWritten,
@@ -539,6 +571,10 @@ impl Fusion {
                     tracing::warn!(path = %path.display(), "FORENSIC DUMP written");
                 }
                 Err(e) => {
+                    // RELEASE the dump claim won before spawn so a later Spoofed
+                    // transition can retry — a transient write failure must not
+                    // permanently suppress the post-mortem dump.
+                    fired_flag.store(false, std::sync::atomic::Ordering::Release);
                     let ev = SpoofingEvent::new(
                         Timestamp::now_mono(),
                         SpoofKind::ForensicDumpFailed,
@@ -1400,5 +1436,34 @@ mod validation_tests {
             ..c.detect
         };
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_non_finite_or_huge_max_home_distance() {
+        // A non-finite / non-positive / absurd boot-anchor radius must fail
+        // closed at startup rather than silently disabling the meaconing-at-
+        // boot check while logging it as ARMED.
+        for bad in [f64::INFINITY, f64::NAN, 0.0, -1.0, 2.0e6] {
+            let c = FusionConfig {
+                nav: NavConfig {
+                    max_home_distance_m: bad,
+                    ..NavConfig::default()
+                },
+                ..FusionConfig::default()
+            };
+            assert!(
+                c.validate().is_err(),
+                "max_home_distance_m={bad} must be rejected"
+            );
+        }
+        // A sane radius still validates.
+        let ok = FusionConfig {
+            nav: NavConfig {
+                max_home_distance_m: 5000.0,
+                ..NavConfig::default()
+            },
+            ..FusionConfig::default()
+        };
+        assert!(ok.validate().is_ok());
     }
 }
