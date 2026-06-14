@@ -112,6 +112,7 @@ class Relay:
         self.gps_fix_type = 0
         self.gps_sats = 0
         self.last_base_mode = None
+        self.rel_alt_m = 0.0
         # Relay-side wire-level GPS spoof (meaconing model). When `spoof_active`,
         # the relay rewrites the lat/lon of every GPS_RAW_INT / GLOBAL_POSITION_INT
         # it forwards to the detector, adding these degree offsets. This is the
@@ -177,6 +178,8 @@ class Relay:
                 elif mt == "GPS_RAW_INT":
                     self.gps_fix_type = msg.fix_type
                     self.gps_sats = msg.satellites_visible
+                elif mt == "GLOBAL_POSITION_INT":
+                    self.rel_alt_m = msg.relative_alt / 1000.0
                 # Forward to the detector — spoofing the position en route if armed.
                 buf = self._maybe_spoof_and_serialize(msg, mt)
                 if buf:
@@ -218,6 +221,21 @@ class Relay:
                     self.gps_fix_type, self.gps_sats))
                 last_report = now
             time.sleep(0.5)
+        return False
+
+    def is_armed(self):
+        return bool((self.last_base_mode or 0) & 0x80)
+
+    def wait_airborne(self, min_alt_m, timeout=40):
+        log("waiting for takeoff (rel_alt >= {:.0f} m)...".format(min_alt_m))
+        end = time.time() + timeout
+        while time.time() < end:
+            if self.rel_alt_m >= min_alt_m:
+                log("airborne: rel_alt={:.1f} m".format(self.rel_alt_m))
+                return True
+            time.sleep(0.5)
+        log("WARN: takeoff not confirmed (rel_alt={:.1f} m) — a later RTL may disarm "
+            "before the detector's read-back dwell completes".format(self.rel_alt_m))
         return False
 
     def set_param(self, name, value):
@@ -277,43 +295,49 @@ def main():
 
     sysid, compid = r.sitl.target_system, r.sitl.target_component
 
-    # Disable pre-arm checks so the copter arms in the bare SITL environment
-    # (no RC, no battery monitor, etc.). W4 finding: without this the copter
-    # never armed (`armed=False`), sat on the ground, and SITL's GPS-glitch
-    # dynamics didn't drive a detectable residual. ARMING_CHECK=0 is the SITL
-    # standard for scripted tests (NEVER for a real vehicle). Send a few times
-    # and give the EKF a beat to set its home origin afterward.
-    log("disabling pre-arm checks (ARMING_CHECK=0) for SITL scripted arm")
+    # Disable pre-arm checks, set home at the current location, and let the EKF
+    # settle so GUIDED can arm in the bare SITL (no RC/battery). W4/W-ARMED: with
+    # only ARMING_CHECK=0 and a plain arm command the copter often stayed
+    # `armed=False` on the ground — then a later RTL disarms instantly and the
+    # detector (correctly, its armed cross-check) reports the disarmed autopilot
+    # as RTL-unconfirmed. ARMING_CHECK=0 is the SITL scripted-test standard
+    # (NEVER for a real vehicle).
+    log("ARMING_CHECK=0 + DO_SET_HOME(current) for SITL scripted arm")
     for _ in range(3):
         r.set_param("ARMING_CHECK", 0)
         time.sleep(0.5)
-    time.sleep(5)  # let EKF settle / set home with checks relaxed
+    # MAV_CMD_DO_SET_HOME param1=1 -> use current location as home/origin.
+    r.sitl.mav.command_long_send(sysid, compid, mavutil.mavlink.MAV_CMD_DO_SET_HOME,
+                                 0, 1, 0, 0, 0, 0, 0, 0)
+    time.sleep(8)  # let the EKF settle / set its origin with checks relaxed
 
-    # Choreograph: GUIDED, arm, takeoff. All SEND-ONLY — the relay thread is
-    # the sole reader of the SITL connection, so we must not call any
-    # recv-blocking helper (set_mode/arm_wait read internally and would
-    # deadlock against the relay). We send raw commands and pace with sleeps,
-    # observing arm/mode outcome via the relay's shared state.
+    # Choreograph: GUIDED, force-arm, takeoff. All SEND-ONLY — the relay thread
+    # is the sole reader of the SITL connection, so we must not call any
+    # recv-blocking helper (it would deadlock against the relay). We send raw
+    # commands, pace with sleeps, and observe arm/mode/alt via the relay state.
     log("mode GUIDED (custom_mode=4)")
-    # ArduCopter GUIDED = custom_mode 4; base_mode needs CUSTOM_MODE_ENABLED.
     r.sitl.mav.set_mode_send(
         sysid, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 4)
     time.sleep(3)
-    log("arming (COMMAND_LONG MAV_CMD_COMPONENT_ARM_DISARM param1=1)")
-    for _ in range(5):
+    # Force-arm (param2 = 21196 magic, bypasses residual checks) and CONFIRM via
+    # the HEARTBEAT armed bit before proceeding — a plain arm silently failed.
+    log("force-arming (MAV_CMD_COMPONENT_ARM_DISARM param1=1 param2=21196)")
+    arm_deadline = time.time() + 30
+    while time.time() < arm_deadline and not r.is_armed():
         r.sitl.mav.command_long_send(
             sysid, compid, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-            0, 1, 0, 0, 0, 0, 0, 0)
+            0, 1, 21196, 0, 0, 0, 0, 0)
+        time.sleep(1.5)
+    log("armed={} ; takeoff to {} m".format(r.is_armed(), args.takeoff_alt))
+    for _ in range(3):
+        r.sitl.mav.command_long_send(
+            sysid, compid, mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+            0, 0, 0, 0, 0, 0, 0, args.takeoff_alt)
         time.sleep(1)
-        # base_mode bit 0x80 = SAFETY_ARMED; relay tracks last HEARTBEAT.
-        if r.last_base_mode is not None and (r.last_base_mode & 0x80):
-            break
-    log("armed={} ; takeoff to {} m".format(
-        bool((r.last_base_mode or 0) & 0x80), args.takeoff_alt))
-    r.sitl.mav.command_long_send(
-        sysid, compid, mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
-        0, 0, 0, 0, 0, 0, 0, args.takeoff_alt)
-    time.sleep(12)
+    # Confirm airborne so the later RTL keeps the copter armed through the
+    # detector's read-back dwell (descending from altitude takes >> the 5 s
+    # verify window, so it stays armed long enough to confirm ActionAcked).
+    r.wait_airborne(args.takeoff_alt * 0.5)
 
     log("clean flight window {} s (detector should stay Normal, preflight Ready)".format(
         args.clean_secs))
