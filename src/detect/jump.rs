@@ -111,6 +111,9 @@ mod tests {
             mag_pos,
             mag_vel,
             dvel_known: true,
+            dvel_free: NedVel::default(),
+            mag_vel_free: 0.0,
+            maneuvering: false,
         }
     }
 
@@ -122,6 +125,9 @@ mod tests {
             mag_pos,
             mag_vel: 0.0,
             dvel_known: false,
+            dvel_free: NedVel::default(),
+            mag_vel_free: 0.0,
+            maneuvering: false,
         }
     }
 

@@ -12,6 +12,11 @@ pub struct CusumState {
     /// Magnitude (one-sided) CUSUM accumulator. Catches circular/spiral
     /// drift where the per-axis CUSUMs oscillate around zero.
     pub s_mag: f32,
+    /// Velocity-aiding (one-sided) CUSUM accumulator over the free-inertial
+    /// velocity-residual magnitude `mag_vel_free`. Catches the SMART
+    /// consistent-velocity walk-off that the position lanes miss because the
+    /// blend tracks the spoofed velocity (drives `dpos`/`dvel` to ~0).
+    pub s_vel_aiding: f32,
 }
 
 impl Default for CusumState {
@@ -22,6 +27,7 @@ impl Default for CusumState {
             s_pos_e: 0.0,
             s_neg_e: 0.0,
             s_mag: 0.0,
+            s_vel_aiding: 0.0,
         }
     }
 }
@@ -35,6 +41,11 @@ pub enum DriftReason {
     /// Magnitude CUSUM exceeded threshold — used when the per-axis sums
     /// stay near zero but `|r|` accumulates (circular / spiral drift).
     Magnitude,
+    /// Velocity-aiding CUSUM exceeded threshold — a sustained free-inertial
+    /// velocity bias the GPS-velocity blend was importing. Fires on the SMART
+    /// consistent-velocity walk-off (faked Doppler / EKF-laundered slow spoof)
+    /// that the position lanes cannot see.
+    VelocityAiding,
 }
 
 /// EWMA smoothing for the online magnitude-noise floor (audit B-02). A small
@@ -66,6 +77,25 @@ const AXIS_NOISE_FACTOR: f32 = 2.5;
 /// warmup every CUSUM is held at 0; a spoof in this short window is still
 /// caught by the jump detector.
 const WARMUP_FIXES: u32 = 20;
+/// EWMA smoothing for the velocity-aiding noise floor. DELIBERATELY ~6× slower
+/// than the other lanes' 0.05: the masked velocity bias a consistent-velocity
+/// walk-off produces ramps on over the blend's convergence (~20 s, not a per-fix
+/// step like the position lanes), so a fast floor would TRACK the attack onset
+/// and the CUSUM would never start (it only freezes the floor once positive —
+/// a chicken-and-egg the position lanes avoid because their residual jumps). A
+/// ~125-fix time constant tracks only minutes-scale honest IMU-velocity-bias
+/// drift, well slower than any walk-off worth catching. The cost is that a
+/// spoofer who ramps in over MANY minutes can still be tracked — the documented
+/// bound in docs/threats.md.
+const VEL_AIDING_NOISE_ALPHA: f32 = 0.008;
+/// Effective velocity-aiding `k` is at least this multiple of the learned
+/// free-inertial velocity-residual noise floor. `mag_vel_free` is a magnitude
+/// (folded/Rayleigh-like) of GPS-Doppler noise minus inertial velocity error,
+/// so a factor ≳1.5 keeps the per-fix increment `mag_vel_free − eff_k` negative
+/// on average under H0 (no attack). 2.0 adds margin against the free-inertial
+/// reference's slowly-growing bias — the cost is reduced sensitivity to a very
+/// slow ramp-on (the documented bound in docs/threats.md).
+const VEL_AIDING_NOISE_FACTOR: f32 = 2.0;
 
 pub struct DriftDetector {
     cfg: DetectConfig,
@@ -85,9 +115,14 @@ pub struct DriftDetector {
     /// the floor and absorbing its own signal (a missed detection).
     axis_noise_n: f32,
     axis_noise_e: f32,
+    /// Online EWMA of the free-inertial velocity-residual magnitude
+    /// `mag_vel_free`, updated ONLY while the velocity-aiding CUSUM is quiescent
+    /// (so a walk-off in progress can't inflate it) and only when GPS velocity
+    /// is present. Drives the adaptive velocity-aiding `eff_k`.
+    vel_aiding_noise: f32,
     /// Counts fixes until the CUSUMs are armed (see `WARMUP_FIXES`). Shared by
-    /// the per-axis and magnitude floors — they learn the same GPS-noise
-    /// environment over the same window.
+    /// the per-axis, magnitude, and velocity-aiding floors — they learn the
+    /// same noise environment over the same window.
     warmup: u32,
 }
 
@@ -99,6 +134,7 @@ impl DriftDetector {
             mag_noise_ewma: 0.0,
             axis_noise_n: 0.0,
             axis_noise_e: 0.0,
+            vel_aiding_noise: 0.0,
             warmup: 0,
         }
     }
@@ -110,6 +146,11 @@ impl DriftDetector {
     /// Current adaptive magnitude-noise floor estimate (for observability/tests).
     pub fn mag_noise_floor(&self) -> f32 {
         self.mag_noise_ewma
+    }
+
+    /// Current adaptive velocity-aiding noise floor estimate (observability/tests).
+    pub fn vel_aiding_floor(&self) -> f32 {
+        self.vel_aiding_noise
     }
 
     pub fn reset(&mut self) {
@@ -155,11 +196,13 @@ impl DriftDetector {
         // Inputs are gated at ingest and nav re-checks finiteness, so this
         // is unreachable today — but the detector is the last line and must
         // not trust upstream.
-        if !(rn.is_finite() && re.is_finite() && rmag.is_finite()) {
+        let rvel_free = r.mag_vel_free as f32;
+        if !(rn.is_finite() && re.is_finite() && rmag.is_finite() && rvel_free.is_finite()) {
             tracing::warn!(
                 rn,
                 re,
                 rmag,
+                rvel_free,
                 "drift detector: non-finite residual — skipping fix (accumulators preserved)"
             );
             return None;
@@ -180,6 +223,18 @@ impl DriftDetector {
             self.axis_noise_n += (rn.abs() - self.axis_noise_n) / w;
             self.axis_noise_e += (re.abs() - self.axis_noise_e) / w;
             self.mag_noise_ewma += (rmag - self.mag_noise_ewma) / w;
+            // Learn the velocity-aiding floor too, but only from fixes that carry
+            // GPS velocity AND are clearly quiet (below base k). The quiet gate
+            // matters because warmup can overlap an in-progress spoof (startup
+            // interpolation misses delay warmup completion); without it the
+            // attack's elevated mag_vel_free poisons the floor and the lane goes
+            // numb. Honest flight stays well under base k, so the floor still
+            // learns; an active walk-off simply doesn't train it. (The `/w`
+            // weighting slightly under-counts skipped fixes, but the honest floor
+            // stays small and base k governs eff_k regardless.)
+            if r.dvel_known && !r.maneuvering && rvel_free < self.cfg.vel_aiding_cusum_k_mps {
+                self.vel_aiding_noise += (rvel_free - self.vel_aiding_noise) / w;
+            }
             self.state = CusumState::default();
             return None;
         }
@@ -205,6 +260,23 @@ impl DriftDetector {
             self.mag_noise_ewma =
                 (1.0 - MAG_NOISE_ALPHA) * self.mag_noise_ewma + MAG_NOISE_ALPHA * rmag;
         }
+        // Velocity-aiding floor: EWMA over CLEARLY-QUIET fixes only — needs GPS
+        // velocity (mag_vel_free is meaningless without Doppler), the lane
+        // quiescent, AND the sample below the base reference k. That last gate is
+        // the key fix for the slow-ramp blind spot: the masked bias ramps on over
+        // the blend's convergence (~20 s), and without it the floor tracked the
+        // rising attack and the CUSUM never started (it only freezes the floor
+        // once positive). Honest realistic flight stays well under base k (max
+        // ~0.45 m/s over 600 s), so quiet fixes still train the floor; an attack
+        // that lifts the bias past base k freezes it.
+        if r.dvel_known
+            && !r.maneuvering
+            && self.state.s_vel_aiding <= 0.0
+            && rvel_free < self.cfg.vel_aiding_cusum_k_mps
+        {
+            self.vel_aiding_noise = (1.0 - VEL_AIDING_NOISE_ALPHA) * self.vel_aiding_noise
+                + VEL_AIDING_NOISE_ALPHA * rvel_free;
+        }
 
         let eff_k_n = k.max(self.axis_noise_n * AXIS_NOISE_FACTOR);
         let eff_k_e = k.max(self.axis_noise_e * AXIS_NOISE_FACTOR);
@@ -215,6 +287,21 @@ impl DriftDetector {
         self.state.s_pos_e = (self.state.s_pos_e + re - eff_k_e).max(0.0);
         self.state.s_neg_e = (self.state.s_neg_e - re - eff_k_e).max(0.0);
         self.state.s_mag = (self.state.s_mag + rmag - eff_k_mag).max(0.0);
+        // Velocity-aiding CUSUM — accumulates the free-inertial velocity-residual
+        // magnitude above its adaptive floor. Gated on GPS velocity being present
+        // (without Doppler the position lanes are gated off too — nothing to
+        // cross-check) AND on NOT maneuvering: a turn makes the free-inertial
+        // velocity diverge from GPS by ~2 m/s of legit attitude/centripetal error
+        // that this lane can't tell from a walk-off, so it FREEZES (holds, neither
+        // accumulates nor decays) until benign flight resumes. The cost is that a
+        // walk-off confined to turns is unobservable here — a documented bound.
+        if r.dvel_known && !r.maneuvering {
+            let eff_k_vel = self
+                .cfg
+                .vel_aiding_cusum_k_mps
+                .max(self.vel_aiding_noise * VEL_AIDING_NOISE_FACTOR);
+            self.state.s_vel_aiding = (self.state.s_vel_aiding + rvel_free - eff_k_vel).max(0.0);
+        }
 
         // Per-axis sums dominate when an attack is linear: report those first.
         // (Past warmup here, so all CUSUMs are armed.)
@@ -235,6 +322,13 @@ impl DriftDetector {
         if self.state.s_mag >= h_mag {
             return Some(DriftReason::Magnitude);
         }
+        // Velocity-aiding catches the SMART consistent-velocity walk-off that the
+        // position lanes structurally cannot see (the blend tracks the spoofed
+        // velocity, driving dpos/dvel to ~0). Reported last so a co-occurring
+        // position drift still yields the more specific axis/magnitude reason.
+        if self.state.s_vel_aiding >= self.cfg.vel_aiding_cusum_h {
+            return Some(DriftReason::VelocityAiding);
+        }
         None
     }
 }
@@ -251,6 +345,34 @@ mod tests {
             mag_pos: (n * n + e * e).sqrt(),
             mag_vel: 0.0,
             dvel_known: true,
+            dvel_free: NedVel::default(),
+            mag_vel_free: 0.0,
+            maneuvering: false,
+        }
+    }
+
+    /// Residual builder that sets the FREE-INERTIAL velocity-residual magnitude
+    /// `mag_vel_free` (the velocity-aiding lane's input) with a quiet position
+    /// residual — for exercising the smart consistent-velocity walk-off lane in
+    /// isolation from the position lanes.
+    fn r_vel_free(mag_vel_free: f64) -> Residual {
+        Residual {
+            dpos: NedPos {
+                n: 0.3,
+                e: 0.2,
+                d: 0.0,
+            },
+            dvel: NedVel::default(),
+            mag_pos: (0.3_f64 * 0.3 + 0.2 * 0.2).sqrt(),
+            mag_vel: 0.0,
+            dvel_known: true,
+            dvel_free: NedVel {
+                n: mag_vel_free,
+                e: 0.0,
+                d: 0.0,
+            },
+            mag_vel_free,
+            maneuvering: false,
         }
     }
 
@@ -539,5 +661,110 @@ mod tests {
             }
         }
         assert_eq!(reason, Some(DriftReason::NorthPositive));
+    }
+
+    #[test]
+    fn velocity_aiding_fires_on_sustained_masked_bias() {
+        // The SMART consistent-velocity walk-off: the position residual stays
+        // quiet (the blend tracks the spoofed velocity) but a sustained ~1 m/s
+        // velocity bias persists in mag_vel_free. After a clean warmup the
+        // velocity-aiding lane must escalate — the position lanes never would.
+        let mut d = DriftDetector::new(DetectConfig::default());
+        warm(&mut d);
+        let mut fired = None;
+        for _ in 0..40 {
+            if let Some(reason) = d.evaluate(&r_vel_free(1.0), None, None) {
+                fired = Some(reason);
+                break;
+            }
+        }
+        assert_eq!(
+            fired,
+            Some(DriftReason::VelocityAiding),
+            "a sustained ~1 m/s free-inertial velocity bias must fire the velocity-aiding lane"
+        );
+    }
+
+    #[test]
+    fn velocity_aiding_quiet_on_small_residual() {
+        // A small free-inertial velocity residual (honest Doppler noise + a little
+        // inertial bias, below the base k) must never accumulate the lane.
+        let mut d = DriftDetector::new(DetectConfig::default());
+        warm(&mut d);
+        for _ in 0..3000 {
+            assert!(d.evaluate(&r_vel_free(0.15), None, None).is_none());
+        }
+    }
+
+    #[test]
+    fn velocity_aiding_suspended_while_maneuvering() {
+        // A coordinated turn legitimately drives mag_vel_free to ~2 m/s; the lane
+        // MUST be frozen while maneuvering or it false-fires on every turn. Even a
+        // large sustained residual must not fire when `maneuvering` is set.
+        let mut d = DriftDetector::new(DetectConfig::default());
+        warm(&mut d);
+        let turning = Residual {
+            maneuvering: true,
+            ..r_vel_free(2.0)
+        };
+        for _ in 0..200 {
+            assert!(
+                d.evaluate(&turning, None, None).is_none(),
+                "velocity-aiding must stay suspended throughout a maneuver"
+            );
+        }
+        // And once the maneuver ends, a genuine sustained bias is caught again.
+        let mut fired = false;
+        for _ in 0..40 {
+            if d.evaluate(&r_vel_free(1.0), None, None) == Some(DriftReason::VelocityAiding) {
+                fired = true;
+                break;
+            }
+        }
+        assert!(fired, "the lane must resume after the maneuver ends");
+    }
+
+    #[test]
+    fn velocity_aiding_requires_doppler() {
+        // Without GPS velocity (dvel_known=false) mag_vel_free is meaningless and
+        // the lane must not accumulate, even on a large value — mirrors the
+        // no-Doppler gating of the position lanes.
+        let mut d = DriftDetector::new(DetectConfig::default());
+        warm(&mut d);
+        let no_dop = Residual {
+            dvel_known: false,
+            ..r_vel_free(5.0)
+        };
+        for _ in 0..200 {
+            assert!(d.evaluate(&no_dop, None, None).is_none());
+        }
+    }
+
+    #[test]
+    fn velocity_aiding_no_false_alarm_on_realistic_doppler_noise() {
+        // 1200 fixes of clean free-inertial velocity residual: GPS Doppler noise
+        // (~0.12 m/s/axis) plus small inertial jitter. |·| is Rayleigh (~0.15 m/s
+        // mean), far below the 0.55 m/s base k. The lane must NOT fire, and the
+        // learned floor must settle in a sane low band (not chase the noise up).
+        let mut d = DriftDetector::new(DetectConfig::default());
+        let mut seed = 0x5EED_0BAD_F00D_1234u64;
+        let sigma = 0.12_f64;
+        let mut fires = 0;
+        for _ in 0..1200 {
+            let (gn, ge) = gauss_pair(&mut seed);
+            let mag = ((gn * sigma).powi(2) + (ge * sigma).powi(2)).sqrt();
+            if d.evaluate(&r_vel_free(mag), None, None).is_some() {
+                fires += 1;
+            }
+        }
+        assert_eq!(
+            fires, 0,
+            "velocity-aiding lane false-fired {fires} time(s) on clean Doppler noise"
+        );
+        let floor = d.vel_aiding_floor();
+        assert!(
+            (0.05..0.45).contains(&floor),
+            "velocity-aiding floor settled out of band: {floor}"
+        );
     }
 }

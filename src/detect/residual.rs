@@ -174,6 +174,22 @@ pub struct Residual {
     pub mag_pos: f64,
     pub mag_vel: f64,
     pub dvel_known: bool,
+    /// Velocity residual against the FREE-INERTIAL track: GPS velocity minus the
+    /// dead-reckoned velocity with the GPS-velocity blend REMOVED, i.e.
+    /// `dvel + nav.aiding_vel()`. Where `dvel` (vs the blended DR velocity) is
+    /// driven to ~0 by the complementary blend for a SMART consistent-velocity
+    /// spoof, this exposes the velocity bias the blend had to import — the
+    /// GPS-velocity-independent signal the velocity-aiding lane fires on. Only
+    /// meaningful when `dvel_known` (needs GPS velocity); zero otherwise.
+    pub dvel_free: NedVel,
+    pub mag_vel_free: f64,
+    /// True when the IMU shows the vehicle is maneuvering (turning) around this
+    /// fix. The velocity-aiding lane is SUSPENDED while set: a coordinated turn
+    /// makes the free-inertial velocity diverge from GPS velocity by ~2 m/s of
+    /// legitimate attitude/centripetal error (the blend masks it for position),
+    /// which would otherwise read as a consistent-velocity walk-off. Derived from
+    /// the gyro, so it is independent of the (GPS-borne) spoof.
+    pub maneuvering: bool,
 }
 
 impl Default for Residual {
@@ -184,6 +200,9 @@ impl Default for Residual {
             mag_pos: 0.0,
             mag_vel: 0.0,
             dvel_known: true,
+            dvel_free: NedVel::default(),
+            mag_vel_free: 0.0,
+            maneuvering: false,
         }
     }
 }

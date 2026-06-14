@@ -899,12 +899,31 @@ impl Fusion {
             }
             None => (NedVel::default(), 0.0, false),
         };
+        // Free-inertial velocity residual: add back the cumulative velocity the
+        // blend imported from GPS (`v_blended − v_free_inertial` = nav aiding),
+        // making this `v_gps − v_free_inertial`. Where `dvel` collapses to ~0
+        // under a smart consistent-velocity spoof (the blend tracks it), this
+        // retains the masked bias. Only meaningful when GPS velocity is known.
+        let (dvel_free, mag_vel_free) = if dvel_known {
+            let aiding = self.nav.aiding_vel();
+            let dvf = NedVel {
+                n: dvel.n + aiding.n,
+                e: dvel.e + aiding.e,
+                d: dvel.d + aiding.d,
+            };
+            (dvf, dvf.horizontal_norm())
+        } else {
+            (NedVel::default(), 0.0)
+        };
         let r = Residual {
             dpos,
             dvel,
             mag_pos: dpos.horizontal_norm(),
             mag_vel,
             dvel_known,
+            dvel_free,
+            mag_vel_free,
+            maneuvering: self.nav.is_maneuvering(),
         };
 
         // Forensic capture of this GPS fix + computed residual + current FSM
@@ -1356,6 +1375,10 @@ impl Fusion {
                     "reason": format!("{:?}", d),
                     "dpos_n_m": r.dpos.n,
                     "dpos_e_m": r.dpos.e,
+                    // mag_vel_free is the discriminating quantity for a
+                    // VelocityAiding fire (the masked velocity bias); ~0 for the
+                    // position-drift reasons.
+                    "mag_vel_free_mps": r.mag_vel_free,
                     "cusum": cusum_to_json(self.fsm.drift_state()),
                 }),
             ),
@@ -1392,6 +1415,8 @@ fn cusum_to_json(s: crate::detect::drift::CusumState) -> serde_json::Value {
         "s_neg_n": s.s_neg_n,
         "s_pos_e": s.s_pos_e,
         "s_neg_e": s.s_neg_e,
+        "s_mag": s.s_mag,
+        "s_vel_aiding": s.s_vel_aiding,
     })
 }
 

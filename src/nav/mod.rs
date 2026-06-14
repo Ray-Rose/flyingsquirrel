@@ -40,6 +40,19 @@ const DEFAULT_MAX_IMU_DT_S: f32 = 0.10;
 /// within a second rather than silently failing open.
 const IMU_STARVATION_SKIP_THRESHOLD: u32 = 25;
 
+/// `recent_gyro_mag` EWMA gains — asymmetric: rise fast (engage the maneuvering
+/// gate within ~0.1 s of a turn starting, before the velocity-aiding lane can
+/// accumulate a false fire), fall slow (~1 s, so the gate persists through the
+/// post-turn velocity-settling transient).
+const MANEUVER_GYRO_ALPHA_RISE: f32 = 0.1;
+const MANEUVER_GYRO_ALPHA_FALL: f32 = 0.01;
+/// Bias-corrected gyro magnitude (rad/s) above which the vehicle is treated as
+/// maneuvering for the velocity-aiding gate. ~2.3°/s — well above straight-flight
+/// gyro noise (σ≈0.002 rad/s) yet far below a normal coordinated turn (a 60 m,
+/// 8 m/s circle is ω≈0.13 rad/s). Straight legs (where a consistent-velocity
+/// walk-off is observable) stay below it; turns sit far above.
+const MANEUVER_GYRO_THRESHOLD_RPS: f32 = 0.04;
+
 #[derive(Debug, Clone, Copy)]
 pub struct NavConfig {
     pub madgwick_beta: f32,
@@ -127,6 +140,27 @@ pub struct DeadReckoner {
     /// of skips, so we warn ONCE per streak rather than every sample. Cleared on
     /// the next successful integration.
     imu_starvation_warned: bool,
+    /// Cumulative velocity (per NED axis) imported into the dead-reckoned
+    /// velocity by the complementary blend SINCE the anchor — i.e. exactly
+    /// `v_blended − v_free_inertial` (both tracks start equal at the anchor and
+    /// integrate the same accel, so their running difference is just the sum of
+    /// blend corrections). This is the GPS-velocity-INDEPENDENT signal the
+    /// velocity-aiding lane needs: a smart / EKF-laundered consistent-velocity
+    /// walk-off drives the position residual AND the post-blend velocity residual
+    /// to ~0 (the blend tracks the spoofed velocity), but the velocity it had to
+    /// import to do so persists here as a bias ≈ the spoof rate. Reset to 0 only
+    /// at an anchor reset (where both tracks coincide).
+    aiding_n: f64,
+    aiding_e: f64,
+    /// Asymmetric EWMA of the bias-corrected gyro magnitude (rad/s) — fast to
+    /// rise, slow to fall. Drives `is_maneuvering()`, which gates the
+    /// velocity-aiding detection lane. A sustained coordinated turn makes the
+    /// FREE-INERTIAL velocity track diverge from GPS velocity by ~2 m/s (legit
+    /// attitude/centripetal error the blend masks for position); the
+    /// velocity-aiding lane would read that as a walk-off. The pure-inertial
+    /// velocity reference is only trustworthy in benign (near-straight,
+    /// un-accelerated) flight, so the lane is suspended while maneuvering.
+    recent_gyro_mag: f32,
 }
 
 impl DeadReckoner {
@@ -149,6 +183,9 @@ impl DeadReckoner {
             anchor_locked: false,
             consecutive_imu_skips: 0,
             imu_starvation_warned: false,
+            aiding_n: 0.0,
+            aiding_e: 0.0,
+            recent_gyro_mag: 0.0,
         }
     }
 
@@ -312,6 +349,20 @@ impl DeadReckoner {
             sample.gyro_rps[2] - self.bias.gyro()[2],
         ];
 
+        // Track the bias-corrected gyro magnitude (asymmetric EWMA) so the
+        // velocity-aiding detection lane can be suspended while maneuvering —
+        // see `recent_gyro_mag` / `is_maneuvering`.
+        let gmag = (gyro_corr[0] * gyro_corr[0]
+            + gyro_corr[1] * gyro_corr[1]
+            + gyro_corr[2] * gyro_corr[2])
+            .sqrt();
+        let a = if gmag > self.recent_gyro_mag {
+            MANEUVER_GYRO_ALPHA_RISE
+        } else {
+            MANEUVER_GYRO_ALPHA_FALL
+        };
+        self.recent_gyro_mag = (1.0 - a) * self.recent_gyro_mag + a * gmag;
+
         // GPS-INDEPENDENT centripetal compensation (cause #3 fix). The
         // accelerometer measures specific force f = a_kinematic − g, and in a
         // sustained coordinated turn a_kinematic is the centripetal ω × v. Left
@@ -432,6 +483,11 @@ impl DeadReckoner {
             if let Some(v) = gps_vel {
                 self.strapdown.set_vel(v);
             }
+            // Both the blended and the free-inertial velocity tracks coincide at
+            // an anchor reset — zero the cumulative aiding so the velocity-aiding
+            // lane measures only post-anchor divergence.
+            self.aiding_n = 0.0;
+            self.aiding_e = 0.0;
             if self.initialized {
                 self.anchor_locked = true;
             }
@@ -449,9 +505,16 @@ impl DeadReckoner {
             let alpha = (dt_blend / tau).clamp(0.0, 1.0) as f64;
             if let Some(vg) = gps_vel {
                 let v = self.strapdown.vel();
+                let cn = alpha * (vg.n - v.n);
+                let ce = alpha * (vg.e - v.e);
+                // Accumulate the velocity the blend imports from GPS this fix.
+                // Summed since the anchor, this is `v_blended − v_free_inertial`
+                // (see `aiding_n/e`) — the velocity-aiding lane's input.
+                self.aiding_n += cn;
+                self.aiding_e += ce;
                 self.strapdown.set_vel(NedVel {
-                    n: v.n + alpha * (vg.n - v.n),
-                    e: v.e + alpha * (vg.e - v.e),
+                    n: v.n + cn,
+                    e: v.e + ce,
                     d: v.d + alpha * (vg.d - v.d),
                 });
             }
@@ -462,6 +525,30 @@ impl DeadReckoner {
     pub fn re_anchor_after_clearing(&mut self, fix: &GpsFix) {
         self.origin = Some((fix.lat_deg, fix.lon_deg, fix.alt_m));
         self.strapdown.set_pos(NedPos::default());
+        // A confirmed-clean re-anchor coincides the two velocity tracks again:
+        // drop stale aiding accumulated during the (cleared) suspicious episode.
+        self.aiding_n = 0.0;
+        self.aiding_e = 0.0;
+    }
+
+    /// Cumulative velocity imported from GPS by the complementary blend since the
+    /// anchor, i.e. `v_blended − v_free_inertial`. GPS-velocity-independent: a
+    /// consistent-velocity walk-off that the blend has absorbed (so the position
+    /// and post-blend velocity residuals read ~0) still shows here as a sustained
+    /// bias ≈ the spoof rate. Drives the velocity-aiding detection lane.
+    pub fn aiding_vel(&self) -> NedVel {
+        NedVel {
+            n: self.aiding_n,
+            e: self.aiding_e,
+            d: 0.0,
+        }
+    }
+
+    /// True when the recent (bias-corrected) gyro magnitude indicates a turn or
+    /// other rotational maneuver, during which the free-inertial velocity track
+    /// is unreliable and the velocity-aiding lane must be suspended.
+    pub fn is_maneuvering(&self) -> bool {
+        self.recent_gyro_mag > MANEUVER_GYRO_THRESHOLD_RPS
     }
 
     pub fn gps_in_ned(&self, fix: &GpsFix) -> Option<NedPos> {

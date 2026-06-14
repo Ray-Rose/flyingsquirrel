@@ -67,6 +67,20 @@ pub struct DetectConfig {
     /// Suspicious episode genuinely ends (commit to Normal / fresh entry /
     /// operator reset) — NOT on a vetoed re-anchor (same episode).
     pub max_dwell_pause_s: f32,
+    /// Velocity-aiding lane — catches the SMART consistent-velocity walk-off
+    /// (RQ-170-style slow spoof) the position + post-blend velocity lanes miss.
+    /// A CUSUM on the FREE-INERTIAL velocity-residual magnitude (`mag_vel_free` =
+    /// |v_gps − v_free_inertial|): a spoofer that fakes Doppler so GPS position
+    /// and velocity stay mutually consistent drives `dpos`/`dvel` to ~0 via the
+    /// blend, but the velocity it imported persists in `mag_vel_free` ≈ the spoof
+    /// rate. `k` (m/s) is the reference value (effective k floors on a learned
+    /// noise estimate, like the drift lane, so honest IMU-velocity-bias jitter +
+    /// GPS Doppler noise don't accumulate); `h` (m/s·fix) is the firing
+    /// threshold. KNOWN BOUND: the free-inertial reference drifts with IMU bias,
+    /// so a sufficiently slow ramp-on can be tracked by the adaptive floor —
+    /// see docs/threats.md.
+    pub vel_aiding_cusum_k_mps: f32,
+    pub vel_aiding_cusum_h: f32,
 }
 
 impl Default for DetectConfig {
@@ -97,6 +111,17 @@ impl Default for DetectConfig {
             // 2× the default suspicious_to_spoofed_dwell_s (10 s). Operators
             // who raise the dwell should raise this proportionally.
             max_dwell_pause_s: 20.0,
+            // Velocity-aiding lane. Base k = 0.55 m/s sits just above the honest
+            // free-inertial velocity-residual ceiling measured on a 600 s
+            // realistic-noise+bias clean flight (mean 0.125, max 0.454 m/s, never
+            // ≥0.5); a consistent-velocity walk-off's masked bias is ~its drift
+            // rate (≈0.8–1.1 m/s for a 1 m/s spoof) — a clean separation. h = 8.0
+            // (m/s·fix) fires on that ~1 m/s bias in ~16–25 fixes, slow enough to
+            // ignore transients. A CUSUM needs SUSTAINED exceedance, so isolated
+            // honest spikes near the floor never reach it. Tuned against the
+            // realistic-noise + consistent-drift sims.
+            vel_aiding_cusum_k_mps: 0.55,
+            vel_aiding_cusum_h: 8.0,
         }
     }
 }

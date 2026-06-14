@@ -468,6 +468,9 @@ mod tests {
             mag_pos: 0.0,
             mag_vel: 0.0,
             dvel_known: true,
+            dvel_free: NedVel::default(),
+            mag_vel_free: 0.0,
+            maneuvering: false,
         }
     }
 
@@ -482,6 +485,9 @@ mod tests {
             mag_pos: 100.0,
             mag_vel: 0.0,
             dvel_known: true,
+            dvel_free: NedVel::default(),
+            mag_vel_free: 0.0,
+            maneuvering: false,
         }
     }
 
@@ -493,6 +499,9 @@ mod tests {
             mag_pos: (n * n + e * e).sqrt(),
             mag_vel: 0.0,
             dvel_known: true,
+            dvel_free: NedVel::default(),
+            mag_vel_free: 0.0,
+            maneuvering: false,
         }
     }
 

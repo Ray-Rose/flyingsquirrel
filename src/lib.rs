@@ -1,8 +1,11 @@
 //! FlyingSquirrel — GPS/IMU drift cross-correlator.
 //!
 //! Detects GPS spoofing by comparing the GPS-reported position against an
-//! independently dead-reckoned position from the IMU. Catches both sudden
-//! jumps (teleport-style attacks) and slow drift (RQ-170-style smart spoofers).
+//! independently dead-reckoned position from the IMU. Catches sudden jumps
+//! (teleport-style attacks), slow positional drift, and — via a free-inertial
+//! velocity-aiding lane — consistent-velocity "walk-off" spoofs that fake
+//! Doppler to evade the position cross-check (the RQ-170 class, and the
+//! EKF-laundered slow ramp). Coverage bounds are documented in docs/threats.md.
 
 pub mod action;
 pub mod attestation;

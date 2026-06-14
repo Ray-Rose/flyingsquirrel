@@ -56,6 +56,24 @@ pub enum SpoofPattern {
     /// drifts unbounded — the regime that stresses the position residual the
     /// most over a long flight.
     DropDoppler { after_s: f32 },
+    /// "Smart" / EKF-laundered drift. Like `GradualDrift` (position ramps at
+    /// `drift_{north,east}_mps`), but ALSO rewrites the reported GPS velocity to
+    /// be CONSISTENT with that ramp (true velocity + the drift vector, re-derived
+    /// into speed/course). Two real cases produce this exact signature: a spoofer
+    /// that fakes Doppler as well as position, and the SITL `--spoof-mode param`
+    /// case where ArduPilot's EKF has FUSED a slow position ramp (its output
+    /// velocity then tracks the ramp). Unlike the naive `GradualDrift`, here
+    /// `|v_gps − v_imu|` equals only the (small, EKF-fusable) drift rate — far
+    /// under the 15 m/s velocity-mismatch threshold — and the complementary
+    /// velocity blend is fed the spoofed velocity, which can pull dead-reckoning
+    /// onto the spoofed track and bound the position residual. This is the hard
+    /// case the position cross-check cannot see; the velocity-aiding lane catches
+    /// it via the free-inertial velocity residual.
+    ConsistentDrift {
+        apply_at_s: f32,
+        drift_north_mps: f32,
+        drift_east_mps: f32,
+    },
 }
 
 pub struct SpoofInjector<G: GpsSource> {
@@ -156,6 +174,40 @@ fn apply_spoof(fix: &mut GpsFix, pattern: &SpoofPattern, elapsed_s: f64) {
         }
         return;
     }
+    // Smart / EKF-laundered drift — perturbs position AND reported velocity
+    // CONSISTENTLY, so the velocity-mismatch cross-check sees only the (small)
+    // drift rate and the velocity blend is fed the spoofed velocity.
+    if let SpoofPattern::ConsistentDrift {
+        apply_at_s,
+        drift_north_mps,
+        drift_east_mps,
+    } = pattern
+    {
+        let t = (elapsed_s - *apply_at_s as f64).max(0.0);
+        if t > 0.0 {
+            let dn = t * *drift_north_mps as f64;
+            let de = t * *drift_east_mps as f64;
+            // Position: equirectangular translation (same as GradualDrift).
+            let lat0 = fix.lat_deg.to_radians();
+            fix.lat_deg += (dn / R_EARTH_M).to_degrees();
+            fix.lon_deg += (de / (R_EARTH_M * lat0.cos())).to_degrees();
+            // Velocity: add the constant drift velocity to the honest reported
+            // velocity and re-derive speed/course, keeping GPS position and
+            // velocity mutually consistent (the defining smart-spoofer trait).
+            let (vn_true, ve_true) = match (fix.speed_mps, fix.course_deg) {
+                (Some(spd), Some(crs)) => {
+                    let c = crs.to_radians();
+                    (spd * c.cos(), spd * c.sin())
+                }
+                _ => (0.0, 0.0),
+            };
+            let vn = vn_true + *drift_north_mps as f64;
+            let ve = ve_true + *drift_east_mps as f64;
+            fix.speed_mps = Some((vn * vn + ve * ve).sqrt());
+            fix.course_deg = Some(ve.atan2(vn).to_degrees().rem_euclid(360.0));
+        }
+        return;
+    }
 
     let (dn, de) = match pattern {
         SpoofPattern::Clean => (0.0, 0.0),
@@ -184,7 +236,8 @@ fn apply_spoof(fix: &mut GpsFix, pattern: &SpoofPattern, elapsed_s: f64) {
         }
         SpoofPattern::VelocityInconsistent { .. }
         | SpoofPattern::AltitudeJump { .. }
-        | SpoofPattern::DropDoppler { .. } => {
+        | SpoofPattern::DropDoppler { .. }
+        | SpoofPattern::ConsistentDrift { .. } => {
             unreachable!("handled above")
         }
     };
