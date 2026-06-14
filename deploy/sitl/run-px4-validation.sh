@@ -93,8 +93,16 @@ HARNESS_RC=$?
 set -e
 
 echo ""
+# Save the FULL detector stdout into the artifact dir — the GitHub Actions log
+# API has been flaky for these runs, so the downloadable detector.log is the
+# reliable place to read the gate-by-gate "MAV VERIFY" line from.
+docker logs fs-detector > "$OUT_DIR/detector.log" 2>&1 || true
 echo "==================== detector log (last 70 lines) ===================="
-docker logs fs-detector 2>&1 | tail -70
+tail -70 "$OUT_DIR/detector.log"
+
+echo ""
+echo "[px4] RTL verify line(s):"
+grep -aE 'MAV VERIFY|MAV SEVER VERIFY' "$OUT_DIR/detector.log" | tail -3 || echo "  (no MAV VERIFY line found)"
 
 echo ""
 echo "[px4] detector event-log assertions:"

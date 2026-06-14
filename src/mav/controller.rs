@@ -41,8 +41,14 @@ const COMMAND_REPEAT: u8 = 3;
 const COMMAND_SPACING: Duration = Duration::from_millis(100);
 /// How long to wait for the autopilot's HEARTBEAT to reflect mode change to
 /// RTL after we send the command. ArduPilot typically updates within 1 HEARTBEAT
-/// cycle (~1s); allow 5s for slow/lossy links.
-const RTB_VERIFY_WINDOW: Duration = Duration::from_secs(5);
+/// cycle (~1s). PX4 is slower (live SITL: it reaches AUTO.RTL ~1s after the
+/// DO_SET_MODE) AND the 3-HEARTBEAT dwell needs ~3 more seconds at PX4's ~1Hz
+/// HEARTBEAT, so 5s was marginal and the read-back sometimes timed out as
+/// ActionUnconfirmed even though PX4 had RTL'd. Allow 10s. On success the verify
+/// returns the instant it confirms, so a longer window only adds patience on the
+/// failure path; it runs in real time on the Spoofed transition (well inside the
+/// detector's run duration), not during the shutdown drain.
+const RTB_VERIFY_WINDOW: Duration = Duration::from_secs(10);
 /// Polling cadence while waiting for the mode change.
 const RTB_VERIFY_POLL: Duration = Duration::from_millis(200);
 /// Number of consecutive polls where `current_mode` must read as RTL before
