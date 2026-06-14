@@ -311,7 +311,32 @@ impl DeadReckoner {
             sample.gyro_rps[1] - self.bias.gyro()[1],
             sample.gyro_rps[2] - self.bias.gyro()[2],
         ];
-        self.attitude.update(&sample.accel_mps2, &gyro_corr, dt);
+
+        // GPS-INDEPENDENT centripetal compensation (cause #3 fix). The
+        // accelerometer measures specific force f = a_kinematic − g, and in a
+        // sustained coordinated turn a_kinematic is the centripetal ω × v. Left
+        // in, that ~1 m/s² horizontal term tilts the Madgwick "down" ~6° and
+        // couples through gravity-comp (`R·f + g` below) into a large DR drift
+        // that false-latches Spoofed on a perfectly healthy drone. We estimate
+        // it from the bias-corrected gyro and the DEAD-RECKONED velocity — NOT
+        // GPS: using the attacker-controlled GPS velocity here would let a
+        // spoofed velocity bias the attitude and pull DR toward the attacker's
+        // track, defeating the whole GPS-vs-inertial cross-check. v_dr freezes
+        // GPS-independent in Suspicious/Spoofed (blend off), so the correction
+        // stays honest exactly when it matters. Bounded so a transiently bad
+        // gyro/velocity can't swing the gravity reference.
+        let v_ned = self.strapdown.vel();
+        let v_body = attitude::rotate_ned_to_body(
+            &self.attitude.q(),
+            &[v_ned.n as f32, v_ned.e as f32, v_ned.d as f32],
+        );
+        let a_cent_body = bound_centripetal([
+            gyro_corr[1] * v_body[2] - gyro_corr[2] * v_body[1],
+            gyro_corr[2] * v_body[0] - gyro_corr[0] * v_body[2],
+            gyro_corr[0] * v_body[1] - gyro_corr[1] * v_body[0],
+        ]);
+        self.attitude
+            .update_with_lin_accel(&sample.accel_mps2, &gyro_corr, dt, &a_cent_body);
 
         let q = self.attitude.q();
         // Rotate body-frame specific force into NED, then recover linear accel.
@@ -491,6 +516,26 @@ fn gps_velocity(fix: &GpsFix) -> Option<NedVel> {
         e: speed * course.sin(),
         d: 0.0,
     })
+}
+
+/// Upper bound (m/s²) on the centripetal compensation magnitude. A real drone's
+/// sustained horizontal acceleration is ≲ 2 g; beyond ~3 g the gyro × velocity
+/// product is almost certainly a transient fault, so we clamp the magnitude
+/// (preserving direction) to keep a bad estimate from swinging the attitude
+/// gravity reference. The Madgwick gradient is already normalized (per-step
+/// effect bounded by β), so this clamp is defense-in-depth.
+const MAX_CENTRIPETAL_MPS2: f32 = 30.0;
+
+/// Clamp the centripetal-compensation vector's magnitude to
+/// `MAX_CENTRIPETAL_MPS2`, preserving direction.
+fn bound_centripetal(a: [f32; 3]) -> [f32; 3] {
+    let mag = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt();
+    if mag > MAX_CENTRIPETAL_MPS2 {
+        let s = MAX_CENTRIPETAL_MPS2 / mag;
+        [a[0] * s, a[1] * s, a[2] * s]
+    } else {
+        a
+    }
 }
 
 pub fn lla_to_ned(lat_deg: f64, lon_deg: f64, alt_m: f64, lat0: f64, lon0: f64) -> NedPos {

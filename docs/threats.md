@@ -358,15 +358,16 @@ All `cargo test` (114 lib + 9 property + integration), `cargo clippy
 | **P3-SITLCI** | 🟢 | **Fixed (S-04).** SITL validation was manual-only. Added `.github/workflows/sitl.yml` — a nightly + on-demand job that builds the detector image, runs `deploy/sitl/run-sitl-validation.sh` (closed-loop ArduPilot SITL), gates on the detector's own event log (Spoofed + ActionAcked), and uploads the event log/forensic dumps. Best-effort (third-party SITL image + Docker networking), so it's NOT a per-push gate. |
 | **P3-PX4** | 🟡 | **Detector side done + documented; live run pending environment.** PX4 support (sever param, packed-mode RTL, autopilot cross-check) is implemented and unit-tested (Phase 1), and the manual PX4 SITL run is documented (`docs/sitl.md` §"Running against PX4 SITL", with a precise status callout). NOT done: a containerized one-command PX4 harness + an actual end-to-end PX4 SITL run — PX4's Gazebo/jMAVSim stack differs from ArduPilot's and can't be exercised from the Windows dev box. This is the standing **PX4 SITL milestone**. |
 
-#### 🟠 PARTIALLY FIXED — false alarms under realistic sensor error
+#### ✅ FIXED (within the tested envelope) — false alarms under realistic sensor error
 
 A realistic-noise harness (`tests/scenario_realistic.rs`, + accel-bias and a
 `CircleHorizontal` turning trajectory in the sim) characterized a detector
 false-latch: under realistic sensor error the detector could sever GPS and
 command RTL on a perfectly healthy drone. The existing integration scenarios
 pass only because they use ~10× cleaner GPS (σ=0.3 m) and ~30× cleaner IMU noise
-than reality. Three compounding causes were identified; **step 1 (the adaptive
-per-axis CUSUM) is now landed and cleared the two linear-flight cases:**
+than reality. Three compounding causes were identified; **steps 1 and 3 are now
+landed and all three realistic characterizations pass (`spoofed=false`, identical
+to the low-noise baseline):**
 
 1. **Per-axis CUSUM is not adaptive — ✅ FIXED (step 1).** The per-axis drift `k`
    was fixed at 1.0 m (0.4σ at GPS σ=2.5 m) while only the *magnitude* lane learned
@@ -389,28 +390,41 @@ per-axis CUSUM) is now landed and cleared the two linear-flight cases:**
    in-flight accel-bias estimation — remains the recommended **step 2** for
    robustness on longer / more-dynamic flights where unbounded cumulative drift
    could still exceed the adaptive floor.
-3. **Centripetal attitude coupling — 🔴 STILL UNFIXED (step 3).** In a sustained
-   coordinated turn the centripetal specific force tilts the Madgwick "down" (~6°),
-   coupling through gravity compensation into a ~90 m residual that no adaptive
-   threshold should (or does) absorb — `sustained_turn_false_fires_known_limitation`
-   still false-latches and stays `#[ignore]`d. (Gating the accel correction off
-   during turns was tried and is WRONG — it removes the gravity reference and lets
-   gyro bias diverge the attitude far worse.) **Fix:** GPS-aided attitude — subtract
-   the GPS-velocity-derived centripetal acceleration before the accel correction.
+3. **Centripetal attitude coupling — ✅ FIXED (step 3).** In a sustained coordinated
+   turn the centripetal specific force tilted the Madgwick "down" (~6°), coupling
+   through gravity compensation into a ~90 m residual. Fixed in `nav/attitude.rs` +
+   `nav/mod.rs`: subtract an `ω × v` linear-acceleration estimate from the
+   accelerometer before the gravity gradient (`update_with_lin_accel`).
+   `sustained_turn_does_not_false_fire` now produces the clean baseline result.
+   **SECURITY NOTE:** the estimate uses the bias-corrected gyro and the
+   DEAD-RECKONED velocity — NOT GPS, despite the original "GPS-velocity-derived"
+   framing. Feeding the attacker-controlled GPS velocity into attitude would let a
+   spoofed velocity bias DR toward the attacker's track (a new missed-detection
+   surface); `v_dr` freezes GPS-independent in Suspicious/Spoofed, so the correction
+   stays honest exactly when it matters. The compensation is bounded and acts only
+   during real angular maneuvers, so it can only remove a false alarm — never hide a
+   spoof: guarded by `spoof_during_turn_is_still_detected` (a real drift mid-turn
+   still latches Spoofed) and the `centripetal_compensation_keeps_turn_attitude_level`
+   unit test. (Gating the accel correction off during turns was tried and is WRONG —
+   it removes the gravity reference and lets gyro bias diverge the attitude.)
 
-**Still a pre-real-flight blocker until step 3 lands:** a healthy drone in a
-sustained coordinated turn would still be false-latched. Step 1 is a localized,
-separately-validated change to `detect/drift.rs` with the full attack-regression
-suite green — no desensitization (`per_axis_real_drift_still_fires_after_learning_noisy_floor`
-plus every `scenario_*` attack test pass). The remaining steps stay deliberately
-deferred to dedicated, separately-validated passes: they are safety-critical
-detection-math changes where a careless change would cause MISSED detections
+**Status:** all three realistic-noise characterizations now pass (no false-latch on
+linear flight, on accel/gyro bias, or in a sustained coordinated turn), with the
+full attack-regression suite green — no desensitization (`per_axis_real_drift_still_fires…`,
+`spoof_during_turn_is_still_detected`, plus every `scenario_*` attack test pass).
+The remaining hardening is **step 2 — the sliding-window residual** (GPS-vs-DR
+displacement over a window), recommended for robustness on flights longer or more
+dynamic than the 90–120 s characterizations, where *unbounded* cumulative DR drift
+could still exceed the adaptive per-axis floor. Step 2 also subsumes the FSM
+clear-gate fix (`state_machine.rs` `pos_clean` still uses the base `cusum_k_m`, so
+clearing from Suspicious is hard at σ=2.5 m). That is robustness hardening, not a
+known false-latch. Each step was done as a dedicated, separately-validated pass:
+safety-critical detection-math where a careless change would cause MISSED detections
 (worse than false alarms).
 
-All `cargo test` (incl. the promoted regressions), `cargo clippy --all-targets
--D warnings`, and `cargo fmt --all --check` are green; the one remaining
-characterization is `#[ignore]`d (run with `cargo test --test scenario_realistic
--- --ignored`).
+All `cargo test` (incl. all promoted regressions and the missed-detection guard),
+`cargo clippy --all-targets -D warnings`, and `cargo fmt --all --check` are green.
+No realistic characterizations remain `#[ignore]`d.
 
 ---
 

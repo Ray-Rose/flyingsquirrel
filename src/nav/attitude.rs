@@ -108,8 +108,37 @@ impl Madgwick {
         (roll, pitch, yaw)
     }
 
-    /// Single update step. `dt` in seconds, gyro in rad/s, accel in m/s².
+    /// Single update step (no maneuver compensation). `dt` in seconds, gyro in
+    /// rad/s, accel (specific force) in m/s². Equivalent to
+    /// `update_with_lin_accel` with a zero linear-acceleration estimate.
     pub fn update(&mut self, accel: &[f32; 3], gyro: &[f32; 3], dt: f32) {
+        self.update_with_lin_accel(accel, gyro, dt, &[0.0; 3]);
+    }
+
+    /// Update step with a body-frame linear-acceleration estimate subtracted
+    /// from the accelerometer before the gravity-direction correction.
+    ///
+    /// The accelerometer measures SPECIFIC FORCE `f = a_kinematic − g` (body
+    /// frame). The Madgwick accel correction assumes `f ≈ −g` (the field points
+    /// opposite gravity at rest), so any sustained kinematic acceleration —
+    /// most importantly the centripetal `ω × v` of a coordinated turn — tilts
+    /// the estimated "down" and corrupts dead-reckoning (the cause-#3
+    /// false-latch). Subtracting a `lin_accel_body` estimate of `a_kinematic`
+    /// recovers `−g` for the correction. The GYRO integration is unaffected (it
+    /// never touches the accelerometer), so a bad estimate can only weaken the
+    /// slow gravity correction — it can never inject motion into the attitude.
+    ///
+    /// `lin_accel_body` must be supplied from INERTIAL quantities (gyro ×
+    /// dead-reckoned velocity) — never from GPS — so this cannot couple a
+    /// spoofed GPS velocity into the attitude (and thence into DR). See
+    /// `nav::DeadReckoner::step`.
+    pub fn update_with_lin_accel(
+        &mut self,
+        accel: &[f32; 3],
+        gyro: &[f32; 3],
+        dt: f32,
+        lin_accel_body: &[f32; 3],
+    ) {
         let q = self.q;
         let w = q.w;
         let x = q.i;
@@ -125,12 +154,22 @@ impl Madgwick {
         let mut qdot_y = 0.5 * (w * gy - x * gz + z * gx);
         let mut qdot_z = 0.5 * (w * gz + x * gy - y * gx);
 
-        // Accel-based gradient correction (if accel is reasonable, i.e. non-zero).
-        let an = (accel[0] * accel[0] + accel[1] * accel[1] + accel[2] * accel[2]).sqrt();
+        // Remove the caller's body-frame linear-acceleration estimate so the
+        // gradient sees gravity alone (centripetal compensation). At rest /
+        // straight flight this is ~0 and the behavior is unchanged.
+        let acc = [
+            accel[0] - lin_accel_body[0],
+            accel[1] - lin_accel_body[1],
+            accel[2] - lin_accel_body[2],
+        ];
+
+        // Accel-based gradient correction (if the compensated accel is
+        // reasonable, i.e. non-zero).
+        let an = (acc[0] * acc[0] + acc[1] * acc[1] + acc[2] * acc[2]).sqrt();
         if an > 1e-3 {
-            let ax = accel[0] / an;
-            let ay = accel[1] / an;
-            let az = accel[2] / an;
+            let ax = acc[0] / an;
+            let ay = acc[1] / an;
+            let az = acc[2] / an;
 
             // Body-frame direction of NED "down" predicted from current q:
             // R(q)ᵀ · [0,0,1].
@@ -187,6 +226,15 @@ impl Madgwick {
 pub fn rotate_body_to_ned(q: &Quaternion<f32>, v: &[f32; 3]) -> [f32; 3] {
     let uq = UnitQuaternion::from_quaternion(*q);
     let r = uq.transform_vector(&Vector3::new(v[0], v[1], v[2]));
+    [r.x, r.y, r.z]
+}
+
+/// Rotate an NED-world vector into the body frame given attitude `q` (Rᵀ·v).
+/// Inverse of `rotate_body_to_ned`. Used to express the dead-reckoned velocity
+/// in body frame for the centripetal (ω × v) attitude compensation.
+pub fn rotate_ned_to_body(q: &Quaternion<f32>, v: &[f32; 3]) -> [f32; 3] {
+    let uq = UnitQuaternion::from_quaternion(*q);
+    let r = uq.inverse_transform_vector(&Vector3::new(v[0], v[1], v[2]));
     [r.x, r.y, r.z]
 }
 
@@ -251,5 +299,60 @@ mod tests {
             "yaw={}",
             yaw.to_degrees()
         );
+    }
+
+    #[test]
+    fn centripetal_compensation_keeps_turn_attitude_level() {
+        // A coordinated level turn (v=8 m/s, r=60 m) produces, in BODY frame, a
+        // CONSTANT specific force [0, v·ω, −g] (centripetal on +Y, gravity on
+        // −Z) and a constant yaw rate ω about +Z. Without compensation the
+        // Madgwick accel correction reads the centripetal as a ~6° tilt and
+        // corrupts dead-reckoning (the cause-#3 false-latch); WITH the inertial
+        // ω×v compensation ([0, v·ω, 0]) the attitude stays level.
+        let v = 8.0_f32;
+        let r = 60.0_f32;
+        let omega = v / r;
+        let cent = v * omega; // ≈ 1.067 m/s²
+        let accel = [0.0, cent, -9.81];
+        let gyro = [0.0, 0.0, omega];
+        let lin = [0.0, cent, 0.0];
+
+        let mut comp = Madgwick::new(0.1);
+        comp.init_from_accel([0.0, 0.0, -9.81]); // start level
+        let mut raw = Madgwick::new(0.1);
+        raw.init_from_accel([0.0, 0.0, -9.81]);
+        for _ in 0..2000 {
+            comp.update_with_lin_accel(&accel, &gyro, 0.01, &lin);
+            raw.update(&accel, &gyro, 0.01);
+        }
+        let (roll_c, pitch_c, _) = comp.to_euler_rad();
+        let (roll_r, _, _) = raw.to_euler_rad();
+        assert!(
+            roll_c.abs() < 0.01 && pitch_c.abs() < 0.01,
+            "compensated turn must stay level: roll={roll_c} pitch={pitch_c}"
+        );
+        // ~atan(cent/g) ≈ 0.108 rad. Confirms the test actually exercises the bug.
+        assert!(
+            roll_r.abs() > 0.05,
+            "uncompensated turn must tilt (control): roll={roll_r}"
+        );
+    }
+
+    #[test]
+    fn zero_lin_accel_matches_plain_update() {
+        // update_with_lin_accel with a zero estimate must be byte-identical to
+        // the plain update() — backward-compatibility guard for the delegation.
+        let accel = [0.3, -0.2, -9.7];
+        let gyro = [0.01, -0.02, 0.05];
+        let mut a = Madgwick::new(0.05);
+        let mut b = Madgwick::new(0.05);
+        for _ in 0..100 {
+            a.update(&accel, &gyro, 0.01);
+            b.update_with_lin_accel(&accel, &gyro, 0.01, &[0.0; 3]);
+        }
+        assert_abs_diff_eq!(a.q().w, b.q().w, epsilon = 1e-9);
+        assert_abs_diff_eq!(a.q().i, b.q().i, epsilon = 1e-9);
+        assert_abs_diff_eq!(a.q().j, b.q().j, epsilon = 1e-9);
+        assert_abs_diff_eq!(a.q().k, b.q().k, epsilon = 1e-9);
     }
 }

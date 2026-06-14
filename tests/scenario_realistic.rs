@@ -30,12 +30,14 @@ use common::TestController;
 use flyingsquirrel::fusion::FusionConfig;
 use flyingsquirrel::ingest::{GpsSource, ImuSource};
 use flyingsquirrel::runtime::spawn_all;
+use flyingsquirrel::sim::spoof::{SpoofInjector, SpoofPattern};
 use flyingsquirrel::sim::trajectory::{CircleHorizontal, LinearNorth, TrajectoryGenerator};
 use flyingsquirrel::sim::{SyntheticGps, SyntheticImu};
 use flyingsquirrel::types::{NavStateKind, SpoofKind, SpoofingEvent};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Clean flight (no spoof injected). Thin wrapper over `run_flight`.
 #[allow(clippy::too_many_arguments)]
 async fn run_clean_flight<T>(
     traj: T,
@@ -46,6 +48,38 @@ async fn run_clean_flight<T>(
     accel_bias: [f32; 3],
     gyro_bias: [f32; 3],
     seed: u64,
+) -> Vec<SpoofingEvent>
+where
+    T: TrajectoryGenerator + Send + Sync + Copy + 'static,
+{
+    run_flight(
+        traj,
+        duration_s,
+        gps_pos_sigma_m,
+        accel_sigma,
+        gyro_sigma,
+        accel_bias,
+        gyro_bias,
+        seed,
+        SpoofPattern::Clean,
+    )
+    .await
+}
+
+/// Run a flight, optionally overlaying a GPS spoof `pattern`, and collect the
+/// emitted events. `Clean` = no attack (any detection is a FALSE ALARM); other
+/// patterns inject a real attack (detection is REQUIRED).
+#[allow(clippy::too_many_arguments)]
+async fn run_flight<T>(
+    traj: T,
+    duration_s: u32,
+    gps_pos_sigma_m: f32,
+    accel_sigma: f32,
+    gyro_sigma: f32,
+    accel_bias: [f32; 3],
+    gyro_bias: [f32; 3],
+    seed: u64,
+    pattern: SpoofPattern,
 ) -> Vec<SpoofingEvent>
 where
     T: TrajectoryGenerator + Send + Sync + Copy + 'static,
@@ -74,7 +108,7 @@ where
 
     let controller = Arc::new(TestController::new());
     let events_handle = controller.events.clone();
-    let gps_boxed: Box<dyn GpsSource> = Box::new(gps);
+    let gps_boxed: Box<dyn GpsSource> = Box::new(SpoofInjector::new(gps, pattern));
     let imu_boxed: Box<dyn ImuSource> = Box::new(imu);
     let handles = spawn_all(
         gps_boxed,
@@ -187,14 +221,14 @@ async fn realistic_bias_does_not_false_fire() {
     );
 }
 
-/// KNOWN LIMITATION (still unfixed after step 1 — needs GPS-aided attitude):
-/// a sustained coordinated turn false-fires worst — the centripetal specific
-/// force tilts the Madgwick attitude (~6°), coupling through gravity
-/// compensation into a large DR residual (~90 m measured). The adaptive
-/// per-axis k does NOT (and should not) absorb a residual this large.
+/// REGRESSION (promoted — fixed by inertial centripetal attitude compensation,
+/// step 3): a sustained coordinated turn must NOT false-fire. The centripetal
+/// specific force used to tilt the Madgwick attitude ~6° and couple a ~90 m DR
+/// residual; subtracting the inertial ω×v estimate (gyro × dead-reckoned
+/// velocity) before the gravity correction keeps the attitude level. Now
+/// produces the same clean result as the low-noise baseline.
 #[tokio::test(start_paused = true)]
-#[ignore = "documents an unfixed limitation: sustained turns false-fire (needs GPS-aided attitude)"]
-async fn sustained_turn_false_fires_known_limitation() {
+async fn sustained_turn_does_not_false_fire() {
     let events = run_clean_flight(
         CircleHorizontal {
             speed_mps: 8.0,
@@ -210,7 +244,41 @@ async fn sustained_turn_false_fires_known_limitation() {
     )
     .await;
     assert!(
-        spoofed("turn", &events),
-        "EXPECTED-FAIL: see docs/threats.md (centripetal attitude-coupling limitation)."
+        !spoofed("turn", &events),
+        "a sustained coordinated turn must NOT false-latch Spoofed \
+         (inertial centripetal attitude compensation, step 3)"
+    );
+}
+
+/// MISSED-DETECTION GUARD for step 3: the inertial centripetal compensation
+/// must not HIDE a real spoof during a turn. Same realistic-noise coordinated
+/// turn, but a 2 m/s GPS position drift is injected partway through — the
+/// detector MUST still latch Spoofed. The compensation only sharpens DR
+/// accuracy and consumes no GPS input, so detection is preserved, not weakened.
+#[tokio::test(start_paused = true)]
+async fn spoof_during_turn_is_still_detected() {
+    let events = run_flight(
+        CircleHorizontal {
+            speed_mps: 8.0,
+            radius_m: 60.0,
+        },
+        120,
+        2.5,
+        0.03,
+        0.002,
+        [0.05, -0.04, 0.03],
+        [0.001, -0.001, 0.0015],
+        0x5EED_1234_5EED_1234,
+        SpoofPattern::GradualDrift {
+            apply_at_s: 30.0,
+            drift_north_mps: 2.0,
+            drift_east_mps: 0.0,
+        },
+    )
+    .await;
+    assert!(
+        spoofed("turn-spoof", &events),
+        "a real GPS drift during a turn MUST still be detected — the centripetal \
+         compensation must not hide a spoof"
     );
 }
