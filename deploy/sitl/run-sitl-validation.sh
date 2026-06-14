@@ -139,11 +139,13 @@ if [[ -f "$OUT_DIR/events.jsonl" ]]; then
     echo "  Spoofed transition in events.jsonl   : $([[ $DET_SPOOFED -eq 0 ]] && echo yes || echo NO)"
     echo "  detector commanded+verified RTL      : $([[ $DET_RTB -eq 0 ]] && echo yes || echo NO)"
     echo "  RTL read-back ActionAcked (confirmed): $([[ $DET_ACKED -eq 0 ]] && echo yes || echo 'no (commanded; bare-SITL copter likely disarmed on landing before the dwell)')"
-    # Phase 2b evidence (informative, not gated): in param mode the EKF fuses the
-    # ramp, so detection should come via the velocity-aiding lane (the
-    # consistent-velocity / EKF-laundered catch) rather than a raw position jump.
+    # Which detection lane fired (informative, not gated). Param mode injects a
+    # POSITION-only SIM_GPS_GLITCH at the raw receiver, so the detector (which
+    # reads GPS_RAW_INT) sees a naive signature and catches it on the position
+    # lane — `VelocityAiding` appearing would mean a consistent-velocity (faked
+    # Doppler) spoof, which only a "smart relay" wire injection produces.
     if grep -q 'VelocityAiding' "$OUT_DIR/events.jsonl"; then
-        echo "  velocity-aiding lane fired           : yes (EKF-laundered consistent-velocity catch)"
+        echo "  velocity-aiding lane fired           : yes (consistent-velocity / faked-Doppler catch)"
     else
         echo "  velocity-aiding lane fired           : no (caught by a position/velocity-mismatch lane)"
     fi

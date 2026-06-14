@@ -35,17 +35,26 @@
 > position-offset attack *as the companion computer sees it*, and exercises the
 > entire detection → sever → RTL → read-back path against real firmware and real
 > MAVLink timing. It does **not** route the offset through ArduPilot's **EKF**, so
-> it does not by itself prove the detector catches a spoof *after the autopilot's
-> own estimator has fused (and possibly rate-limited or rejected) it*. That
-> EKF-efficacy proof is the harness's `--spoof-mode param` path: it ramps
-> `SIM_GPS_GLITCH_*` gradually so ArduPilot's EK3 FUSES the offset (a step is
-> innovation-gated), logs `EKF_STATUS_REPORT` as evidence the EKF fused it (and
-> later dropped its GPS lane on the sever), and relies on the detector's
-> velocity-aiding lane to catch the EKF-laundered consistent-velocity output. As
-> of SITL **Phase 2b** this is wired as a second CI matrix leg
-> (`SPOOF_MODE=param` in [`sitl.yml`](../.github/workflows/sitl.yml), independent
-> of the relay leg via `fail-fast: false`); its first green run is the pending
-> milestone.
+> it does not by itself prove the autopilot's own estimator was on the spoofed
+> GPS, nor that the sever actually STOPS the aiding. That proof is the harness's
+> `--spoof-mode param` path, **validated green as of SITL Phase 2b** (a second CI
+> matrix leg, `SPOOF_MODE=param` in [`sitl.yml`](../.github/workflows/sitl.yml),
+> independent of relay via `fail-fast: false`). It ramps `SIM_GPS_GLITCH_*`
+> gradually so ArduPilot's EK3 FUSES the offset (a step is innovation-gated) and
+> logs `EKF_STATUS_REPORT` throughout. The first run answered both halves of the
+> open question: EK3 **fused** the ramp (`gps_glitching` stayed clear,
+> `pos_horiz_variance` grew 0→6 m) AND the detector's GPS sever made the EKF
+> **drop its absolute-position lane** (`pos_horiz_abs` cleared, `const_pos_mode`
+> set) — i.e. `GPS_TYPE=0` actually stops the aiding, not just echoes the param.
+>
+> **Scope of param mode (important):** the detector reads the RAW receiver
+> (`GPS_RAW_INT`), which `SIM_GPS_GLITCH` offsets in POSITION only (honest
+> Doppler), so from the detector's view this is a NAIVE spoof caught by the
+> position lane — param mode validates the EKF-fusion + sever-drops-lane path, NOT
+> the velocity-aiding lane. Exercising the velocity-aiding lane (Phase 2a)
+> end-to-end on SITL needs a consistent-velocity WIRE spoof (a "smart relay" that
+> fakes Doppler too — a noted follow-up); that lane is currently proven by the
+> local `ConsistentDrift` characterization (`tests/scenario_consistent_drift.rs`).
 >
 > ### Bugs this validation found and fixed (invisible to `mavsim`)
 > The whole point of testing against real firmware: `mavsim` was circular (it

@@ -418,10 +418,16 @@ def main():
         # simulated GPS receiver via SIM_GPS_GLITCH_Y (DEGREES; verified against
         # ArduPilot SIM_GPS.cpp). A STEP is innovation-gated by EK3 (rejected),
         # so we RAMP it in the watch loop below over --glitch-ramp-secs: each
-        # epoch's jump stays under the gate and the EKF FUSES the offset. This is
-        # the EKF-laundered "smart spoofer" whose fused output (position AND a
-        # self-consistent velocity) the detector's velocity-aiding lane must
-        # catch — the part the relay/wire path does NOT exercise.
+        # epoch's jump stays under the gate and the EKF FUSES the offset. This
+        # proves the part the relay/wire path does NOT: the autopilot's OWN
+        # estimator was on the spoofed GPS (EKF_STATUS gps_glitching stays clear,
+        # pos_horiz_var grows) AND the detector's GPS sever makes EK3 drop its
+        # absolute-position lane (pos_horiz_abs clears / const_pos_mode sets) —
+        # i.e. GPS_TYPE=0 actually STOPS the aiding. NOTE: the detector reads the
+        # RAW receiver (GPS_RAW_INT), which SIM_GPS_GLITCH offsets in position
+        # only (honest Doppler), so detection is via the position lane (a naive
+        # signature). Exercising the velocity-aiding lane end-to-end would need a
+        # consistent-velocity WIRE spoof (a "smart relay" that fakes Doppler too).
         log("INJECTING SPOOF (SITL param, gradual ramp over {:.0f}s to ~{} m east). "
             "Pre-injection {}".format(args.glitch_ramp_secs, args.glitch_m, r.ekf_summary()))
 
