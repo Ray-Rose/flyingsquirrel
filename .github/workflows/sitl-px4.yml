@@ -7,15 +7,14 @@ name: PX4 SITL bring-up (smoke)
 # detector-side PX4 support (sever EKF2_GPS_CTRL, PX4 RTL-mode decode) is already
 # unit-tested; this is the first LIVE PX4 exercise.
 #
-# Dispatch + push-on-the-WIP-branch for now (no schedule) — it's a heavier
-# third-party Gazebo image and a work-in-progress milestone, not yet a gate. The
-# branch-scoped push trigger lets it auto-run each iteration before the workflow
-# exists on the default branch (where `gh workflow run` would resolve it); remove
-# the push trigger when this is promoted.
+# Nightly + on-demand, like sitl.yml (the ArduPilot loop). PX4 SITL is a heavier
+# third-party Gazebo image, so this is a separate workflow on its own schedule.
+# Both jobs (bring-up smoke + closed loop) are validated green; the closed loop
+# is detector-gated (Spoofed + RTL action + PX4 reaching AUTO.RTL).
 on:
+  schedule:
+    - cron: "47 7 * * *" # ~07:47 UTC nightly (offset from sitl.yml's 07:17)
   workflow_dispatch:
-  push:
-    branches: [feat/px4-sitl]
 
 permissions:
   contents: read
