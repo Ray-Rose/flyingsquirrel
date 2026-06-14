@@ -370,6 +370,36 @@ The `docs/sitl_smoke.sh` script defaults to ArduPilot. To smoke-test PX4
 instead, edit the script to set `--vehicle px4` and point at the PX4
 SITL endpoint.
 
+### Findings — live PX4 SITL (2026-06-14)
+
+Run via the containerized PX4 path (`deploy/sitl/run-px4-validation.sh` +
+`.github/workflows/sitl-px4.yml`, using the headless `jonasvautherin/px4-gazebo-headless`
+image, which PUSHES MAVLink to a target). The detector reaches preflight Ready on
+PX4's HEARTBEAT/GPS_RAW_INT/HIGHRES_IMU, detects a spoof, severs
+`EKF2_GPS_CTRL=0` (read-back **verified**), and commands RTL; PX4 reaches AUTO.RTL
+and the closed-loop gate passes. Two concrete answers to the open questions:
+
+- **PX4 `custom_mode` byte order (a real bug, now fixed).** The observed wire
+  values are AUTO.LOITER=`0x03040000`, AUTO.TAKEOFF=`0x02040000`,
+  AUTO.RTL=`0x05040000` — i.e. `main_mode` is bits 16–23 and `sub_mode` is bits
+  24–31 (the `px4_custom_mode` union). The detector's `px4_split_mode` had these
+  SWAPPED, so a real PX4 RTL decoded as a non-AUTO mode and verification reported
+  `ActionUnconfirmed` even though PX4 had RTL'd. Fixed + pinned with
+  `px4_split_mode_matches_real_sitl_wire_values`. The self-consistent round-trip
+  unit test could not have caught this.
+- **Q2 answered: PX4 LANDs/disarms on GPS sever (no fallback).** With
+  `EKF2_GPS_CTRL=0` and no non-GPS position source configured, PX4 loses its
+  position estimate and cannot hold/navigate an armed RTL — it lands and disarms.
+  So the detector's RTL read-back is `ActionUnconfirmed` (its armed cross-check
+  correctly refuses to certify RTL on a disarming autopilot; `causal_mode` reads
+  `armed=false` while the mode is AUTO.RTL). The closed-loop GATE still passes
+  (Spoofed + sever-verified + PX4 reaches an RTL-equivalent), but the STRONG
+  `ActionAcked` read-back on PX4 needs a non-GPS position fallback
+  (`EKF2_*` optical-flow / external-vision) so PX4 can stay airborne+armed
+  through the verify dwell — a deferred follow-up. (ArduCopter holds armed RTL
+  because its EKF tolerates the `GPS_TYPE=0` sever differently and stays
+  navigable.)
+
 ## When SITL passes, what's next
 
 A passing SITL smoke test answers the four open questions above and
