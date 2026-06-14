@@ -434,12 +434,17 @@ frozen-GPS. Guarded by `no_doppler_flight_does_not_false_fire` (no false-latch w
 Doppler drops mid-flight) and `frozen_gps_during_no_doppler_is_still_detected` (a
 stuck/replayed GPS with no Doppler still latches Spoofed).
 
-**Remaining (minor, not a known false-latch):** the FSM clear-gate
-(`state_machine.rs` `pos_clean` uses base `cusum_k_m`, so clearing from Suspicious
-is hard at σ=2.5 m) — latent robustness only, not exercised on clean flight since
-steps 1/3 keep the detector from entering Suspicious. Each step was a dedicated,
-separately-validated pass: safety-critical detection-math where a careless change
-would cause MISSED detections (worse than false alarms).
+**FSM clear-gate (done):** `pos_clean` used the base `cusum_k_m` (1 m), below the
+realistic GPS residual (~3 m at σ=2.5 m), so a clean-but-noisy flight could get
+STUCK in Suspicious after a transient anomaly. Now noise-aware (`pos_thresh =
+max(base, mag_noise_floor × 3)` — the same step-1 adaptive floor), with two safety
+gates so the generous threshold can never clear a real attack: clearing requires
+NO detector firing this fix AND the drift CUSUMs quiescent (a slow drift
+accumulating below the clean threshold keeps a CUSUM elevated, barring a clear —
+it escalates instead). Tests: `noisy_clean_flight_clears_from_suspicious`,
+`accumulating_drift_is_not_cleared_away`. Each detection-math change above was a
+dedicated, separately-validated pass: a careless change would cause MISSED
+detections (worse than false alarms).
 
 All `cargo test` (incl. all promoted regressions and the missed-detection guards),
 `cargo clippy --all-targets -D warnings`, and `cargo fmt --all --check` are green.

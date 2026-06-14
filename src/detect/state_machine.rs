@@ -80,6 +80,20 @@ pub struct StateMachine {
 /// adversarially), not just glitching.
 const MAX_CONSECUTIVE_DROPOUT: u8 = 5;
 
+/// The position-clean threshold for clearing Suspicious is at least this
+/// multiple of the drift detector's learned magnitude noise floor. ~3× the
+/// Rayleigh mean (≈3.7σ) so clean-noise spikes rarely break the continuous-clean
+/// streak that `normal_clear_dwell_s` requires — otherwise a noisy-but-honest
+/// flight (σ≈2.5 m ⇒ ~3 m residual) could never satisfy the sub-noise base
+/// `cusum_k_m` (1 m) and the FSM would get STUCK in Suspicious after a transient.
+const CLEAR_NOISE_FACTOR: f32 = 3.0;
+/// Clearing also requires every drift CUSUM to be below this fraction of the
+/// firing threshold `cusum_h_m`. A slow drift accumulating between the detection
+/// floor and the (generous) clean threshold keeps a CUSUM elevated, so this
+/// bars it from being classified "clean" and cleared away (which would reset the
+/// CUSUM each cycle — a missed detection).
+const CLEAR_QUIESCENT_FRACTION: f32 = 0.25;
+
 impl StateMachine {
     pub fn new(cfg: DetectConfig) -> Self {
         Self {
@@ -262,27 +276,43 @@ impl StateMachine {
         // Use the external-anomaly flag drained at the top.
         let detector_firing = jump.is_some() || drift.is_some() || pending_external;
 
-        // Sample-level cleanliness: independent of CUSUM accumulator state.
-        // While SUSPICIOUS, CUSUMs may stay elevated long after the attack ends,
-        // so we use the instantaneous residual to decide whether to clear.
+        // Sample-level cleanliness — decides whether to CLEAR back to Normal.
         //
-        // When GPS lacks Doppler (`!dvel_known`):
-        //   - velocity-mismatch detector is skipped (jump.rs)
-        //   - vel_clean is forced true here
-        // Together those give an attacker a free pass to walk at just under
-        // `cusum_k_m`. To compensate, we TIGHTEN the position cleanliness gate
-        // by half when velocity isn't observable — an attacker has to commit
-        // to <0.5*k drift to remain "clean," which makes a sub-k slow-drift
-        // attack accumulate visibly in the per-axis CUSUM.
-        let pos_thresh = if r.dvel_known {
+        // Base position threshold, with the no-Doppler tightening preserved: when
+        // GPS lacks Doppler the velocity-mismatch detector is skipped and
+        // `vel_clean` is forced true, so we TIGHTEN the position gate by half to
+        // deny an attacker a free pass to walk at just under `cusum_k_m`.
+        let base_pos_thresh = if r.dvel_known {
             self.cfg.cusum_k_m
         } else {
             self.cfg.cusum_k_m * 0.5
         };
+        // Make the clean threshold NOISE-AWARE: the base `cusum_k_m` (1 m) sits
+        // below the realistic GPS residual (~3 m at σ=2.5 m), so a clean-but-noisy
+        // flight could never look "clean" and the FSM got STUCK in Suspicious
+        // after a transient anomaly. Scale by the drift detector's learned
+        // magnitude noise floor (the step-1 adaptive floor), so clearing tracks
+        // the actual noise environment instead of a fixed sub-noise constant.
+        let pos_thresh = base_pos_thresh.max(self.drift.mag_noise_floor() * CLEAR_NOISE_FACTOR);
         let pos_clean = (r.mag_pos as f32) < pos_thresh;
         let vel_clean =
             !r.dvel_known || (r.mag_vel as f32) < self.cfg.max_velocity_mismatch_mps * 0.25;
-        let sample_clean = pos_clean && vel_clean;
+        // Two safety gates so the generous noise-aware threshold can never clear
+        // an ACTUAL attack: (1) no detector may be firing this fix — an active
+        // jump/drift/external anomaly is never "clean"; (2) the drift CUSUMs must
+        // be QUIESCENT — a slow drift sitting between the detection floor and
+        // `pos_thresh` doesn't fire yet but keeps a CUSUM elevated, so requiring
+        // it near zero stops that drift from being cleared away (which would
+        // reset the CUSUM each cycle and let the attack never escalate).
+        let st = self.drift.state();
+        let cusum_peak = st
+            .s_pos_n
+            .max(st.s_neg_n)
+            .max(st.s_pos_e)
+            .max(st.s_neg_e)
+            .max(st.s_mag);
+        let drift_quiescent = cusum_peak < self.cfg.cusum_h_m * CLEAR_QUIESCENT_FRACTION;
+        let sample_clean = pos_clean && vel_clean && drift_quiescent && !detector_firing;
 
         if let Some(j) = jump {
             out.push(Event::Jump(j));
@@ -452,6 +482,46 @@ mod tests {
             mag_pos: 100.0,
             mag_vel: 0.0,
             dvel_known: true,
+        }
+    }
+
+    /// Residual with explicit N/E components (for noise/drift sequences).
+    fn r(n: f64, e: f64) -> Residual {
+        Residual {
+            dpos: NedPos { n, e, d: 0.0 },
+            dvel: NedVel::default(),
+            mag_pos: (n * n + e * e).sqrt(),
+            mag_vel: 0.0,
+            dvel_known: true,
+        }
+    }
+
+    /// Deterministic Gaussian pair (SplitMix64 + Box-Muller); reproducible per
+    /// seed, no `rand` dependency.
+    fn gauss_pair(state: &mut u64) -> (f64, f64) {
+        let mut next = || {
+            *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = *state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            ((z >> 11) as f64 + 1.0) / ((1u64 << 53) as f64 + 1.0)
+        };
+        let u1 = next();
+        let u2 = next();
+        let rr = (-2.0 * u1.ln()).sqrt();
+        (
+            rr * (std::f64::consts::TAU * u2).cos(),
+            rr * (std::f64::consts::TAU * u2).sin(),
+        )
+    }
+
+    /// Feed `n` fixes of clean σ=2.5 m GPS noise so the drift detector learns a
+    /// realistic noise floor (and the FSM stays Normal — step 1).
+    fn warm_noise_floor(sm: &mut StateMachine, seed: &mut u64, n: usize) {
+        for _ in 0..n {
+            let (gn, ge) = gauss_pair(seed);
+            sm.evaluate(&r(gn * 2.5, ge * 2.5), 0.0, None, None);
         }
     }
 
@@ -771,5 +841,71 @@ mod tests {
         // Detector continues to work after reset.
         sm.evaluate(&big_jump(), 200.0, None, None);
         assert_eq!(sm.state(), NavStateKind::Suspicious);
+    }
+
+    #[test]
+    fn noisy_clean_flight_clears_from_suspicious() {
+        // Clear-gate fix: at realistic GPS noise (σ=2.5 m ⇒ ~3 m residual), a
+        // clean flight must be able to CLEAR back to Normal after a transient
+        // anomaly. With the old sub-noise pos_thresh (cusum_k_m = 1 m) the
+        // instantaneous residual was essentially never < 1 m, so the FSM got
+        // STUCK in Suspicious. The noise-aware threshold tracks the learned floor.
+        let mut sm = StateMachine::new(DetectConfig::default());
+        let mut seed = 0x1234_5678_9ABC_DEF0u64;
+        warm_noise_floor(&mut sm, &mut seed, 60);
+        assert_eq!(
+            sm.state(),
+            NavStateKind::Normal,
+            "noise alone must not fire"
+        );
+
+        // A transient external anomaly (e.g. a brief vertical-rate blip) → Suspicious.
+        sm.note_external_anomaly();
+        sm.evaluate(&r(0.0, 0.0), 100.0, None, None);
+        assert_eq!(sm.state(), NavStateKind::Suspicious);
+
+        // Realistic-noise clean fixes past normal_clear_dwell_s must CLEAR.
+        let mut t = 100.0;
+        for _ in 0..60 {
+            t += 1.0;
+            let (gn, ge) = gauss_pair(&mut seed);
+            sm.evaluate(&r(gn * 2.5, ge * 2.5), t, None, None);
+            if sm.state() == NavStateKind::Normal {
+                break;
+            }
+        }
+        assert_eq!(
+            sm.state(),
+            NavStateKind::Normal,
+            "a clean noisy flight must clear from Suspicious (noise-aware clear gate)"
+        );
+    }
+
+    #[test]
+    fn accumulating_drift_is_not_cleared_away() {
+        // Clear-gate SAFETY: a drift above the detection floor but below the
+        // generous noise-aware clean threshold keeps a CUSUM elevated, so it must
+        // NOT be classified clean and cleared (which would reset the CUSUM each
+        // cycle and let the attack never escalate). It must instead escalate.
+        let mut sm = StateMachine::new(DetectConfig::default());
+        let mut seed = 0x0F0F_0F0F_0F0F_0F0Fu64;
+        warm_noise_floor(&mut sm, &mut seed, 60);
+        sm.note_external_anomaly();
+        sm.evaluate(&r(0.0, 0.0), 100.0, None, None);
+        assert_eq!(sm.state(), NavStateKind::Suspicious);
+
+        // Sustained ~7 m north drift: above eff_k (~5 m) so it accumulates the
+        // per-axis CUSUM, below pos_thresh (~9 m) so a naive threshold would call
+        // it "clean". The quiescent gate must prevent a clear; it escalates.
+        let mut t = 100.0;
+        for _ in 0..40 {
+            t += 1.0;
+            sm.evaluate(&r(7.0, 0.0), t, None, None);
+        }
+        assert_ne!(
+            sm.state(),
+            NavStateKind::Normal,
+            "an accumulating drift must not be cleared away"
+        );
     }
 }
