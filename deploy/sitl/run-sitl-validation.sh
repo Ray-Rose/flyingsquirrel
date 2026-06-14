@@ -73,19 +73,26 @@ docker run -d --name fs-sitl --network "$NET" --network-alias sitl \
 # run is inspectable (and CI-gatable) after the containers are torn down.
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
+# The detector image runs as a NON-root user (uid 1000); make the bind-mount
+# world-writable so it can write events.jsonl / forensic dumps. On Docker
+# Desktop the mount is writable regardless, but a Linux CI runner's dir is
+# owned by the runner uid, which the container user can't write (os error 13).
+chmod 777 "$OUT_DIR"
 
 echo "[run] starting FlyingSquirrel detector (mav GPS+IMU+controller) at $DET_IP"
 # --mav-target = the HARNESS ip:port (where the detector sends its RTL +
 # PARAM_SET); the harness relays those into SITL, closing the loop.
 # --mav-no-source-filter because the harness relays from its own container
-# address, not the autopilot's (documented SITL exception, not production).
+# address, not the autopilot's; --mav-allow-any-source-port because the relay's
+# SOURCE port isn't guaranteed to match the target port across environments
+# (both are documented SITL exceptions, not production posture).
 docker run -d --name fs-detector --network "$NET" --ip "$DET_IP" \
     -v "${OUT_DIR}:/out" \
     "$FS_IMAGE" \
     --gps-source mav --imu-source mav --controller mav \
     --vehicle ardu-copter \
     --mav-bind 0.0.0.0:14551 --mav-target "${HARNESS_IP}:14551" \
-    --mav-no-source-filter \
+    --mav-no-source-filter --mav-allow-any-source-port \
     --expected-home="${HOME_LAT},${HOME_LON}" --max-home-distance-m 5000 \
     --json-log /out/events.jsonl --forensic-dir /out \
     --imu-rate 10 \
