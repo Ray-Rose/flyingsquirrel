@@ -1,24 +1,46 @@
 # Validating FlyingSquirrel against ArduPilot SITL
 
-> ## ✅ VALIDATED — full closed loop confirmed (Phase W4)
+> ## ✅ VALIDATED — full closed loop, continuously re-checked in CI
 >
-> FlyingSquirrel has been run end-to-end against **real ArduPilot ArduCopter
-> SITL firmware** and **passed the complete closed loop**: clean flight →
-> 400 m GPS spoof injected into the autopilot's simulated receiver → detector
-> escalated `Normal → Suspicious → Spoofed` (residual ≈ 400 m, exactly the
-> injected offset) → detector commanded RTL → **the autopilot switched to
-> RTL (custom_mode 6)**, with a forensic dump written capturing 150 GPS
-> fixes / 600 IMU samples / 150 residuals of the real incident.
+> FlyingSquirrel runs end-to-end against **real ArduPilot ArduCopter SITL
+> firmware** in a nightly + on-demand GitHub Actions job
+> ([`.github/workflows/sitl.yml`](../.github/workflows/sitl.yml)), so the
+> headline "validated against ArduPilot SITL" claim is *continuously* re-proven
+> rather than a one-time manual result. The job stands up three containers on a
+> private Docker network (ArduPilot SITL + the detector + a bidirectional MAVLink
+> relay/choreographer), force-arms and flies the copter, injects a GPS spoof, and
+> **fails unless the detector's own event log proves it did the work** — a
+> native-EKF reaction alone cannot pass it.
+>
+> **The proven chain** (one CI run): clean airborne flight → ~400 m GPS spoof →
+> detector escalates `Normal → Suspicious → Spoofed` (cumulative residual ≈ the
+> injected offset) → detector severs GPS (`PARAM_SET GPS_TYPE=0`) + commands RTL
+> (`MAV_CMD_NAV_RETURN_TO_LAUNCH`) → **the autopilot switches to an RTL-equivalent
+> mode** → detector read-back returns **`ActionAcked`** (COMMAND_ACK + causal mode
+> change + fresh-HEARTBEAT dwell while still armed), with a forensic dump
+> capturing the real incident. The CI gate requires the `Spoofed` transition + an
+> RTL action event + the autopilot's mode flip; recent runs additionally confirm
+> the stronger `ActionAcked` read-back.
 >
 > **One-command reproduction** (Windows + Docker Desktop, or Linux + Docker):
 > ```
 > pwsh deploy/sitl/run-sitl-validation.ps1      # Windows
 > bash deploy/sitl/run-sitl-validation.sh        # Linux
 > ```
-> This stands up three containers (ArduPilot SITL + the detector + a
-> bidirectional MAVLink relay/choreographer) on a private Docker network,
-> flies the copter, injects the spoof, and asserts the autopilot reaches an
-> RTL-equivalent mode. Exit 0 = closed loop verified.
+>
+> ### ⚠️ Scope — what CI proves, and the one gap it does NOT
+> CI injects the spoof at the **wire level**: the relay rewrites the lat/lon of
+> every `GPS_RAW_INT` / `GLOBAL_POSITION_INT` it forwards to the detector
+> (`--spoof-mode relay`, the default). This faithfully models a meaconing /
+> position-offset attack *as the companion computer sees it*, and exercises the
+> entire detection → sever → RTL → read-back path against real firmware and real
+> MAVLink timing. It does **not** route the offset through ArduPilot's **EKF**, so
+> it does not yet prove the detector catches a spoof *after the autopilot's own
+> estimator has fused (and possibly rate-limited or rejected) it*. That
+> EKF-efficacy proof is the harness's `--spoof-mode param` path (a gradual
+> `SIM_GPS_GLITCH_*` ramp the EKF will fuse, observed via `EKF_STATUS_REPORT`) and
+> is the **Phase 2 validation gap** — implemented in the harness but not yet wired
+> into CI.
 >
 > ### Bugs this validation found and fixed (invisible to `mavsim`)
 > The whole point of testing against real firmware: `mavsim` was circular (it
@@ -30,22 +52,34 @@
 > - **W1 (V-SYNC) 🟡** — ArduPilot's ~10 Hz `SCALED_IMU` put GPS ~100 ms past
 >   the IMU buffer; the 20 ms tolerance rejected every fix. Fixed with
 >   velocity forward-extrapolation.
-> - **Harness mechanics** — the GPS-glitch param is `SIM_GPS_GLITCH_Y` in
->   **degrees** (not meters), and `ARMING_CHECK=0` is needed for the scripted
->   arm.
+> - **W-RATE 🟡 (the `--imu-rate` footgun)** — the default 100 Hz sizes the IMU
+>   integration-gap gate to 25 ms, but ArduPilot's ~10 Hz stream has ~100 ms
+>   gaps, so the gate skipped every step and the detector silently failed open
+>   (no GPS cross-check). The harness passes `--imu-rate 10`; real deployments
+>   must set it to the link's actual raw-sensor stream rate.
+> - **W-ARMED 🟡** — RTL read-back legitimately returned `ActionUnconfirmed`
+>   against a *grounded, disarmed* SITL copter (RTL disarms instantly on the
+>   ground, so there is no causal *armed* mode change to confirm). The detector
+>   was correct to refuse certification; the harness now force-arms
+>   (`MAV_CMD_COMPONENT_ARM_DISARM` param2=21196) + `DO_SET_HOME` and confirms the
+>   copter is airborne before spoofing — which is what unlocked `ActionAcked`.
+> - **Harness mechanics** — `--mav-no-source-filter` + `--mav-allow-any-source-port`
+>   are needed because the relay forwards from its own container address/port, and
+>   `ARMING_CHECK=0` enables the scripted SITL arm. **All three are SITL-only —
+>   never production posture.** (The `--spoof-mode param` route additionally uses
+>   `SIM_GPS_GLITCH_*`, which is in **degrees**, not meters.)
 >
 > ### Empirical answers to the open questions below
-> - **Does the autopilot RTL?** YES — observed `custom_mode 6 (RTL)` after the
->   detector's command. (Our verifier also accepts LAND/SMART_RTL.)
-> - **Does the spoof reach the detector?** YES — once injected with the
->   correct `SIM_GPS_GLITCH_Y` (degrees), the relayed `GPS_RAW_INT` carried
->   the offset and the detector saw a ~400 m residual.
-> - **Does verification pass on real timing?** The detector fired and
->   commanded RTL within the watch window; the autopilot's mode flip was
->   observed by the harness.
+> - **Does the autopilot RTL?** YES — observed an RTL-equivalent `custom_mode`
+>   after the detector's command (the verifier also accepts LAND/SMART_RTL).
+> - **Does the spoof reach the detector?** YES — the relayed `GPS_RAW_INT` /
+>   `GLOBAL_POSITION_INT` carried the wire-level offset and the detector saw a
+>   ~400 m cumulative residual.
+> - **Does verification pass on real timing?** YES — with the copter force-armed
+>   and airborne, the read-back returns `ActionAcked` within the dwell window.
 >
-> The notes below remain as the manual / from-source reproduction path and
-> the original open-questions worksheet.
+> The notes below remain as the manual / from-source reproduction path (including
+> the `--spoof-mode param` EKF route) and the original open-questions worksheet.
 
 ---
 

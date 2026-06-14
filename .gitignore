@@ -20,6 +20,10 @@ spoof-*.json
 /deploy/sitl/last-run/
 /deploy/sitl/last-detector-log.txt
 
+# Python bytecode cache from importing the SITL harness / driver modules.
+__pycache__/
+*.pyc
+
 # Editor / OS cruft
 *.swp
 *~

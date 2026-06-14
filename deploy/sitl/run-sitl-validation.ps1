@@ -1,5 +1,5 @@
 # One-command closed-loop SITL validation for FlyingSquirrel (Windows /
-# Docker Desktop host). PowerShell sibling of run-sitl-validation.sh — same
+# Docker Desktop host). PowerShell sibling of run-sitl-validation.sh - same
 # three-container topology (sitl + flyingsquirrel + harness), driven via the
 # Docker Desktop CLI which is on the Windows PATH (no WSL integration needed).
 #
@@ -61,7 +61,14 @@ try {
     # --mav-target = the HARNESS ip:port (where the detector sends its RTL +
     # PARAM_SET); the harness relays those into SITL, closing the loop.
     # --mav-no-source-filter because the harness relays from its own container
-    # address, not the autopilot's (documented SITL exception, not production).
+    # address, not the autopilot's; --mav-allow-any-source-port because the relay's
+    # SOURCE port isn't guaranteed to match the target port across environments
+    # (both are documented SITL exceptions, not production posture).
+    # --imu-rate 10 is REQUIRED: ArduPilot SITL streams SCALED_IMU at ~10 Hz, so
+    # the default 100 Hz sizes the IMU integration-gap gate to 25 ms - smaller than
+    # the real ~100 ms cadence, so the gate would skip every step and the detector
+    # would silently fail open (no GPS cross-check, never detects). This footgun is
+    # why a bare Windows run can look "clean" while detecting nothing.
     $OutDirUnix = $OutDir -replace '\\','/'
     docker run -d --name fs-detector --network $NET --ip $DET_IP `
         -v "${OutDirUnix}:/out" `
@@ -69,9 +76,10 @@ try {
         --gps-source mav --imu-source mav --controller mav `
         --vehicle ardu-copter `
         --mav-bind 0.0.0.0:14551 --mav-target "${HARNESS_IP}:14551" `
-        --mav-no-source-filter `
+        --mav-no-source-filter --mav-allow-any-source-port `
         "--expected-home=$HOME_LAT,$HOME_LON" --max-home-distance-m 5000 `
         --json-log /out/events.jsonl --forensic-dir /out `
+        --imu-rate 10 `
         --duration 180 --log-level info | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "detector start failed" }
 
@@ -94,8 +102,49 @@ try {
     } | Select-Object -Last 40
     Write-Host "[run] full detector log: $logPath"
 
+    # Independent confirmation from the detector's OWN event log that it actually
+    # detected the spoof and commanded/verified RTL - not just that the autopilot
+    # happened to enter RTL (ArduPilot's native EKF glitch protection can do that
+    # on its own). Mirrors the gating in run-sitl-validation.sh.
+    Write-Host ""
+    Write-Host "[run] detector event-log assertions:"
+    $detSpoofed = $false   # detector detected + escalated to Spoofed
+    $detRtb     = $false   # detector commanded RTL and tried to verify (Acked or Unconfirmed)
+    $detAcked   = $false   # the STRONGER read-back confirmation (autopilot held armed RTL)
+    $eventsPath = Join-Path $OutDir "events.jsonl"
+    if (Test-Path $eventsPath) {
+        $events = Get-Content $eventsPath -Raw
+        if ($events -match '"to":"Spoofed"')                { $detSpoofed = $true }
+        if ($events -match 'ActionAcked|ActionUnconfirmed') { $detRtb = $true }
+        if ($events -match 'ActionAcked')                   { $detAcked = $true }
+        Write-Host ("  Spoofed transition in events.jsonl   : " + $(if ($detSpoofed) { "yes" } else { "NO" }))
+        Write-Host ("  detector commanded+verified RTL      : " + $(if ($detRtb)     { "yes" } else { "NO" }))
+        Write-Host ("  RTL read-back ActionAcked (confirmed): " + $(if ($detAcked)   { "yes" } else { "no (commanded; bare-SITL copter likely disarmed on landing before the dwell)" }))
+    } else {
+        Write-Host "  events.jsonl not found at $OutDir (detector may not have armed)"
+    }
+
     Write-Host ""
     Write-Host "[run] harness exit code: $harnessRc  (0=closed-loop RTL verified, 3=no RTL in window, 2=setup)"
+    # The closed loop is PROVEN when the detector's OWN log shows it detected the
+    # spoof (Spoofed) and commanded + attempted to verify RTL (ActionAcked or
+    # ActionUnconfirmed), AND the autopilot reached an RTL-equivalent mode
+    # (harnessRc 0). A native-EKF reaction cannot produce a detector Spoofed event,
+    # so this can't pass without the detector doing the work. The stronger
+    # ActionAcked read-back is reported but NOT gated (bare-SITL arming is
+    # environment-fragile; a grounded copter disarms on landing before the dwell).
+    if ($harnessRc -eq 0 -and $detSpoofed -and $detRtb) {
+        if ($detAcked) {
+            Write-Host "[run] PASS: closed loop verified - detector detected, commanded RTL, read-back ActionAcked; autopilot reached RTL."
+        } else {
+            Write-Host "[run] PASS: closed loop verified - detector detected + commanded RTL; autopilot reached RTL. (RTL read-back was ActionUnconfirmed: expected when the bare-SITL copter disarms on landing before the dwell.)"
+        }
+        exit 0
+    }
+    if ($harnessRc -eq 0) {
+        Write-Host "[run] PARTIAL: autopilot reached RTL but the detector log lacks a Spoofed transition and/or an RTL action event - inspect $eventsPath (a native-EKF reaction can reach RTL without the detector)."
+        exit 3
+    }
     exit $harnessRc
 }
 finally {

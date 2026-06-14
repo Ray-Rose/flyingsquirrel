@@ -1,5 +1,23 @@
 #!/usr/bin/env python3
 """
+⚠️  DEPRECATED (Phase V prototype) — DO NOT USE FOR NEW RUNS.
+
+Superseded by the maintained, CI-gated harness:
+  • deploy/sitl/sitl_harness.py          — the relay + flight choreographer
+  • deploy/sitl/run-sitl-validation.sh   — one-command Linux / CI driver
+  • deploy/sitl/run-sitl-validation.ps1  — one-command Windows driver
+
+This early driver injects the spoof via SIM_GPS1_POS_X/Y in *metres* (a
+body-frame antenna-offset param), which DIVERGES from the maintained harness:
+that one defaults to wire-level relay meaconing (--spoof-mode relay) and, for
+its EKF route, uses SIM_GPS_GLITCH_* in *degrees* — not SIM_GPS1_POS in metres.
+It also lacks the force-arm / wait-airborne choreography that the RTL read-back
+confirmation (ActionAcked) depends on, so a run here will under-report. It is
+kept only as a historical reference and is guarded to refuse to run without
+--force-deprecated. See docs/sitl.md for the current procedure.
+
+---
+
 SITL closed-loop driver for FlyingSquirrel validation (Phase V).
 
 Runs INSIDE the ArduPilot SITL container (uses the vendored pymavlink at
@@ -48,7 +66,18 @@ def main():
     ap.add_argument("--clean-secs", type=float, default=20.0)
     ap.add_argument("--glitch-m", type=float, default=300.0)
     ap.add_argument("--watch-secs", type=float, default=40.0)
+    ap.add_argument("--force-deprecated", action="store_true",
+                    help="run this deprecated prototype anyway (see banner / docs/sitl.md)")
     args = ap.parse_args()
+
+    if not args.force_deprecated:
+        log("DEPRECATED: this Phase-V prototype is superseded by "
+            "deploy/sitl/sitl_harness.py + run-sitl-validation.{sh,ps1}. Its "
+            "SIM_GPS1_POS-in-metres injection diverges from the maintained "
+            "harness and it lacks the force-arm choreography that ActionAcked "
+            "needs. Re-run with --force-deprecated only if you specifically need "
+            "this historical path; otherwise see docs/sitl.md.")
+        return 2
 
     log("connecting to SITL at {}".format(args.sitl))
     m = mavutil.mavlink_connection(args.sitl, retries=10)
