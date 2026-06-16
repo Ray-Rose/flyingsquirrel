@@ -146,6 +146,28 @@ pub fn expected_autopilot_byte(profile: VehicleProfile) -> u8 {
     }
 }
 
+/// One autopilot PARAM_VALUE echo as tracked by the monitor. `recv_count` is
+/// the running number of echoes recorded for this parameter NAME over the
+/// monitor's lifetime — it is what lets the sever read-back count DISTINCT
+/// post-send echoes robustly: the verifier snapshots the count at send-time and
+/// requires it to advance by the dwell, instead of trying to sample distinct
+/// arrivals through a latest-only map (which coalesces several fast echoes into
+/// one and would starve the dwell in the real action flow, where the verify task
+/// only starts polling after every PARAM_SET retry — and hence every echo — has
+/// already landed).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ParamEcho {
+    /// The echoed parameter value (sever confirmation looks for ≈0).
+    pub value: f32,
+    /// Raw MAVLink `MAV_PARAM_TYPE` byte off the wire, matched against the type
+    /// we set so a forged zero-echo of the wrong type is rejected.
+    pub param_type: u8,
+    /// Monotonic ns (relative to `boot`) the most recent echo was received.
+    pub recv_ns: u64,
+    /// Count of echoes recorded for this name (monotonic, saturating).
+    pub recv_count: u64,
+}
+
 /// Atomic-state view of the connected autopilot. Constructed once and shared
 /// via Arc across the listener (writer) and watchdog/controller (readers).
 pub struct MavMonitor {
@@ -190,14 +212,17 @@ pub struct MavMonitor {
     /// returns the most recent ACK for THAT specific command, immune to
     /// noise from unrelated traffic.
     pub acks_by_cmd: Mutex<HashMap<u16, (u16, u64)>>,
-    /// Per-parameter PARAM_VALUE record: trimmed param name → (value, mono ns
-    /// of receipt). The autopilot echoes a PARAM_VALUE for every PARAM_SET it
-    /// applies — this map is what lets `sever_gps` CONFIRM the GPS-disable
-    /// parameter actually took effect instead of trusting fire-and-forget UDP
-    /// (an unconfirmed sever means the autopilot may still be navigating on
-    /// spoofed GPS when RTL fires). Same 64-entry / evict-oldest bounding as
-    /// `acks_by_cmd`.
-    params_by_name: Mutex<HashMap<Vec<u8>, (f32, u64)>>,
+    /// Per-parameter PARAM_VALUE record: trimmed param name → (value, wire
+    /// `param_type` byte, mono ns of receipt). The autopilot echoes a
+    /// PARAM_VALUE for every PARAM_SET it applies — this map is what lets
+    /// `sever_gps` CONFIRM the GPS-disable parameter actually took effect
+    /// instead of trusting fire-and-forget UDP (an unconfirmed sever means the
+    /// autopilot may still be navigating on spoofed GPS when RTL fires). The
+    /// `param_type` is retained so `verify_sever_engaged` can require the echo's
+    /// type to match the one we set — a forged zero-echo of the wrong type no
+    /// longer counts — and `recv_count` lets it count DISTINCT post-send echoes.
+    /// Same 64-entry / evict-oldest bounding as `acks_by_cmd`.
+    params_by_name: Mutex<HashMap<Vec<u8>, ParamEcho>>,
     /// Source `(IP, port)` of the first HEARTBEAT we accepted. After this is
     /// set, the listener rejects packets from any other source — even if the
     /// IP is on the source-IP allowlist. Defends against a co-located attacker
@@ -320,11 +345,20 @@ impl MavMonitor {
 
     /// Record one PARAM_VALUE observation. `param_id` is the raw 16-byte
     /// field from the wire; trailing NULs are stripped so lookups can use the
-    /// logical name (`b"GPS_TYPE"`). Keyed per-name for the same reason ACKs
-    /// are keyed per-command: a GCS parameter download streaming hundreds of
-    /// PARAM_VALUEs during our read-back window must not stomp the one echo
-    /// we care about.
-    pub fn record_param_value(&self, now: Instant, boot: Instant, param_id: &[u8], value: f32) {
+    /// logical name (`b"GPS_TYPE"`). `param_type` is the raw MAVLink
+    /// `MAV_PARAM_TYPE` byte off the wire, retained so the sever verifier can
+    /// reject a zero-echo whose type doesn't match the param we set. Keyed
+    /// per-name for the same reason ACKs are keyed per-command: a GCS parameter
+    /// download streaming hundreds of PARAM_VALUEs during our read-back window
+    /// must not stomp the one echo we care about.
+    pub fn record_param_value(
+        &self,
+        now: Instant,
+        boot: Instant,
+        param_id: &[u8],
+        value: f32,
+        param_type: u8,
+    ) {
         let ns = now.saturating_duration_since(boot).as_nanos() as u64;
         let name: Vec<u8> = param_id.iter().copied().take_while(|&b| b != 0).collect();
         if name.is_empty() {
@@ -334,7 +368,19 @@ impl MavMonitor {
             .params_by_name
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        map.insert(name, (value, ns));
+        // Update the latest (value, type, ns) and bump the per-name receipt
+        // counter so the sever verifier can count distinct echoes without
+        // depending on poll-vs-echo timing.
+        let entry = map.entry(name).or_insert(ParamEcho {
+            value,
+            param_type,
+            recv_ns: ns,
+            recv_count: 0,
+        });
+        entry.value = value;
+        entry.param_type = param_type;
+        entry.recv_ns = ns;
+        entry.recv_count = entry.recv_count.saturating_add(1);
         // Bound the map: an autopilot has thousands of params and a full GCS
         // param download would otherwise grow this without limit. We only
         // ever look up the handful of sever-relevant names; cap at 64 and
@@ -342,7 +388,7 @@ impl MavMonitor {
         if map.len() > 64 {
             if let Some(oldest) = map
                 .iter()
-                .min_by_key(|(_, (_, ns))| *ns)
+                .min_by_key(|(_, e)| e.recv_ns)
                 .map(|(k, _)| k.clone())
             {
                 map.remove(&oldest);
@@ -351,8 +397,9 @@ impl MavMonitor {
     }
 
     /// Read the most recent PARAM_VALUE for a specific (trimmed) param name.
-    /// Returns `(value, mono_ns)` or `None` if never observed.
-    pub fn last_param_value(&self, name: &[u8]) -> Option<(f32, u64)> {
+    /// Returns the `ParamEcho` (value, wire type, receipt ns, receipt count) or
+    /// `None` if never observed.
+    pub fn last_param_value(&self, name: &[u8]) -> Option<ParamEcho> {
         let map = self
             .params_by_name
             .lock()
@@ -507,10 +554,13 @@ mod tests {
         // 16-byte field with trailing NULs, as it arrives on the wire.
         let mut pid = [0u8; 16];
         pid[..8].copy_from_slice(b"GPS_TYPE");
-        m.record_param_value(boot + Duration::from_millis(5), boot, &pid, 0.0);
-        let (val, ns) = m.last_param_value(b"GPS_TYPE").expect("param recorded");
-        assert_eq!(val, 0.0);
-        assert!(ns > 0);
+        // 2 == MAV_PARAM_TYPE_INT8, the type GPS_TYPE is set/echoed as.
+        m.record_param_value(boot + Duration::from_millis(5), boot, &pid, 0.0, 2);
+        let e = m.last_param_value(b"GPS_TYPE").expect("param recorded");
+        assert_eq!(e.value, 0.0);
+        assert_eq!(e.param_type, 2);
+        assert!(e.recv_ns > 0);
+        assert_eq!(e.recv_count, 1);
         // Unrelated param doesn't satisfy the lookup.
         assert_eq!(m.last_param_value(b"EKF2_GPS_CTRL"), None);
     }
@@ -528,17 +578,25 @@ mod tests {
             let mut other = [0u8; 16];
             let name = format!("PARAM_{i}");
             other[..name.len()].copy_from_slice(name.as_bytes());
-            m.record_param_value(boot + Duration::from_millis(1 + i), boot, &other, i as f32);
+            m.record_param_value(
+                boot + Duration::from_millis(1 + i),
+                boot,
+                &other,
+                i as f32,
+                9,
+            );
         }
         // Our recent sever echo.
         let mut gps = [0u8; 16];
         gps[..8].copy_from_slice(b"GPS_TYPE");
-        m.record_param_value(boot + Duration::from_millis(500), boot, &gps, 0.0);
-        let (val, ns) = m
+        m.record_param_value(boot + Duration::from_millis(500), boot, &gps, 0.0, 2);
+        let e = m
             .last_param_value(b"GPS_TYPE")
             .expect("recent sever echo must survive the flood");
-        assert_eq!(val, 0.0);
-        assert!(ns > 0);
+        assert_eq!(e.value, 0.0);
+        assert_eq!(e.param_type, 2);
+        assert!(e.recv_ns > 0);
+        assert_eq!(e.recv_count, 1);
     }
 
     #[test]

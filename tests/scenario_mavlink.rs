@@ -3,7 +3,10 @@
 //! Spawns a fake autopilot that emits MAVLink GPS_RAW_INT + HIGHRES_IMU with
 //! a sudden-jump spoof, runs the FlyingSquirrel detector against it via UDP,
 //! and asserts that the autopilot receives `MAV_CMD_NAV_RETURN_TO_LAUNCH`
-//! and a `PARAM_SET GPS_TYPE=0` within the bounded test duration.
+//! and a `PARAM_SET GPS_TYPE=0` within the bounded test duration. The fake
+//! autopilot ACKs the RTL (→ `ActionAcked` read-back) and echoes `PARAM_VALUE`
+//! for the sever PARAM_SET (→ the typed/causal/multi-echo sever read-back
+//! CONFIRMS, so no CRITICAL `ActionFailed`).
 //!
 //! Uses fixed UDP ports on 127.0.0.1 — if you run this concurrently with
 //! something else on those ports it'll fail. The detector dwell is
@@ -23,7 +26,7 @@ use flyingsquirrel::types::SpoofKind;
 use mavlink::common::{
     GpsFixType, HighresImuUpdatedFlags, MavAutopilot, MavCmd, MavMessage, MavModeFlag, MavResult,
     MavState, MavType as MmMavType, COMMAND_ACK_DATA, GPS_RAW_INT_DATA, HEARTBEAT_DATA,
-    HIGHRES_IMU_DATA,
+    HIGHRES_IMU_DATA, PARAM_VALUE_DATA,
 };
 use mavlink::peek_reader::PeekReader;
 use mavlink::{MavHeader, MavlinkVersion};
@@ -129,6 +132,21 @@ async fn mavlink_loopback_detects_jump_and_commands_rtl() {
                             let mut r = ap_reactions.lock().unwrap();
                             r.sever_gps_count += 1;
                         }
+                        // Echo PARAM_VALUE back, exactly as a real autopilot (and
+                        // mavsim) does. This is what lets the detector's
+                        // closed-loop sever read-back CONFIRM the GPS-disable
+                        // param was applied (typed, causal, multi-echo dwell);
+                        // each of the controller's 3 PARAM_SET retries gets an
+                        // echo, so the dwell of 2 is met. Without these echoes
+                        // the read-back correctly stays unconfirmed (CRITICAL).
+                        let pv = MavMessage::PARAM_VALUE(PARAM_VALUE_DATA {
+                            param_id: p.param_id,
+                            param_value: p.param_value,
+                            param_type: p.param_type,
+                            param_count: 1,
+                            param_index: 0,
+                        });
+                        send_one(&ap_listen_socket, detector_addr, &pv, &ap_listen_seq).await;
                     }
                     _ => {}
                 }
@@ -322,6 +340,7 @@ async fn mavlink_loopback_detects_jump_and_commands_rtl() {
     let saw_link_up = kinds.contains(&SpoofKind::LinkRestored);
     let saw_action_acked = kinds.contains(&SpoofKind::ActionAcked);
     let saw_action_unconfirmed = kinds.contains(&SpoofKind::ActionUnconfirmed);
+    let saw_action_failed = kinds.contains(&SpoofKind::ActionFailed);
     assert!(
         saw_link_up,
         "expected LinkRestored event (heartbeat detected) — saw: {:?}",
@@ -335,6 +354,15 @@ async fn mavlink_loopback_detects_jump_and_commands_rtl() {
     assert!(
         !saw_action_unconfirmed,
         "did not expect ActionUnconfirmed — saw: {:?}",
+        *kinds
+    );
+    // Closed-loop SEVER read-back: now that the fake autopilot echoes
+    // PARAM_VALUE for each PARAM_SET, the detector's typed/causal/multi-echo
+    // dwell must CONFIRM the GPS-disable param took effect — i.e. NO CRITICAL
+    // ActionFailed event (which is what an unconfirmed sever emits).
+    assert!(
+        !saw_action_failed,
+        "expected sever read-back to confirm (no CRITICAL ActionFailed) — saw: {:?}",
         *kinds
     );
 }

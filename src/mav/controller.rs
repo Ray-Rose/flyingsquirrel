@@ -10,8 +10,8 @@
 //! Single-packet loss must never mean a stolen drone.
 
 use super::monitor::{
-    is_rtl_mode, px4_encode_mode, MavMonitor, VehicleProfile, MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-    PX4_MAIN_MODE_AUTO, PX4_SUB_MODE_AUTO_RTL,
+    is_rtl_mode, px4_encode_mode, MavMonitor, ParamEcho, VehicleProfile,
+    MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, PX4_MAIN_MODE_AUTO, PX4_SUB_MODE_AUTO_RTL,
 };
 use super::MavLink;
 use crate::action::FlightController;
@@ -68,6 +68,20 @@ const SEVER_VERIFY_POLL: Duration = Duration::from_millis(150);
 /// A sever-param read-back this close to zero counts as "GPS aiding disabled"
 /// (GPS_TYPE=0 / EKF2_GPS_CTRL=0 echo back as 0.0; tolerate float noise).
 const SEVER_CONFIRMED_EPS: f32 = 0.5;
+/// How many DISTINCT, causal (post-send), correct-type zero-echoes the sever
+/// read-back requires before it confirms. This is the sever analogue of the RTL
+/// verifier's fresh-HEARTBEAT dwell (`RTB_VERIFY_DWELL_POLLS`): a single injected
+/// PARAM_VALUE=0 must no longer be able to fake "GPS aiding disabled" and thereby
+/// SUPPRESS the CRITICAL "sever unconfirmed" operator warning — the asymmetry
+/// where the most safety-critical action had a 1-packet confirmation while RTL
+/// had four gates (audit D1). `sever_gps` sends `COMMAND_REPEAT` (3) PARAM_SETs
+/// 100 ms apart and a compliant autopilot echoes a PARAM_VALUE for each, so a
+/// real sever yields ~3 echoes — a dwell of 2 is reliably met (and tolerates one
+/// dropped UDP datagram) while still forcing an attacker to inject ≥2 echoes over
+/// the window. NB: the exact per-PARAM_SET echo cadence is firmware behavior the
+/// nightly SITL job exercises against real ArduPilot/PX4; if a real autopilot
+/// echoes only once, lower this or solicit echoes with PARAM_REQUEST_READ.
+const SEVER_VERIFY_DWELL_ECHOES: u8 = 2;
 
 /// The autopilot parameter whose zeroing disables GPS aiding, with its MAVLink
 /// type, for `profile`. Split out as a pure function so the per-profile choice
@@ -88,6 +102,35 @@ fn sever_gps_param(profile: VehicleProfile) -> (&'static [u8], MavParamType) {
         VehicleProfile::ArduCopter => (b"GPS_TYPE", MavParamType::MAV_PARAM_TYPE_INT8),
         VehicleProfile::Px4 => (b"EKF2_GPS_CTRL", MavParamType::MAV_PARAM_TYPE_INT32),
     }
+}
+
+/// Pure decision for the sever read-back: does this `ParamEcho` confirm the
+/// GPS-disable parameter was applied? ALL of:
+///   * **causality** — the echo was received AFTER our send (`recv_ns > sent_at`),
+///     so a stale or replayed pre-send echo can't confirm;
+///   * **type-match** — the echo's wire `param_type` equals the one we set
+///     (`INT8` for `GPS_TYPE`, `INT32` for `EKF2_GPS_CTRL`); a forged zero-echo of
+///     the wrong type is rejected;
+///   * **value ≈ 0** — the disable actually took (echoes back as 0.0);
+///   * **dwell** — at least `SEVER_VERIFY_DWELL_ECHOES` echoes have been recorded
+///     for this param since the send-time `baseline_count`, so a SINGLE injected
+///     `PARAM_VALUE=0` can no longer fake confirmation and suppress the CRITICAL
+///     "sever unconfirmed" warning (audit D1: closing the asymmetry with the
+///     four-gate RTL verifier).
+///
+/// Split out as a pure function so the gating is exhaustively unit-testable
+/// without constructing a live controller (which binds a UDP socket).
+fn sever_echo_confirms(
+    echo: ParamEcho,
+    sent_at: u64,
+    baseline_count: u64,
+    expected_ty: u8,
+) -> bool {
+    let causal = echo.recv_ns > sent_at;
+    let typed_zero = echo.value.abs() < SEVER_CONFIRMED_EPS && echo.param_type == expected_ty;
+    let dwell_met =
+        echo.recv_count.saturating_sub(baseline_count) >= SEVER_VERIFY_DWELL_ECHOES as u64;
+    causal && typed_zero && dwell_met
 }
 
 pub struct MavFlightController {
@@ -115,6 +158,14 @@ pub struct MavFlightController {
     /// PARAM_VALUE echo to be timestamped strictly AFTER this, so a stale
     /// pre-send echo (or a replayed one) can't fake confirmation.
     sever_sent_at_ns: AtomicU64,
+    /// The monitor's PARAM_VALUE receipt count for the sever param, snapshotted
+    /// at the instant `sever_gps` sends. `verify_sever_engaged` requires the
+    /// count to advance by `SEVER_VERIFY_DWELL_ECHOES` past this baseline, which
+    /// counts DISTINCT post-send echoes robustly — the verify task only starts
+    /// polling after every PARAM_SET retry (and hence every echo) has already
+    /// landed, so a latest-only sample would otherwise see just one coalesced
+    /// echo and the dwell could never be met.
+    sever_echo_baseline: AtomicU64,
 }
 
 impl MavFlightController {
@@ -159,6 +210,7 @@ impl MavFlightController {
             monitor,
             rtb_sent_at_ns: AtomicU64::new(0),
             sever_sent_at_ns: AtomicU64::new(0),
+            sever_echo_baseline: AtomicU64::new(0),
         })
     }
 
@@ -284,6 +336,16 @@ impl FlightController for MavFlightController {
         // the drone flies home on the still-spoofed GPS, the exact RQ-170 failure
         // this system exists to prevent. Branch by profile (see `sever_gps_param`).
         let (name, param_type) = sever_gps_param(self.profile);
+        // Snapshot the monitor's current echo count for this param BEFORE any
+        // packet leaves, so `verify_sever_engaged` counts only THIS round's
+        // post-send echoes (count must advance by the dwell past this baseline).
+        let echo_baseline = self
+            .monitor
+            .last_param_value(name)
+            .map(|e| e.recv_count)
+            .unwrap_or(0);
+        self.sever_echo_baseline
+            .store(echo_baseline, Ordering::Release);
         // Capture send-time BEFORE the first packet leaves so
         // `verify_sever_engaged` can require a causal (post-send) PARAM_VALUE
         // echo from the autopilot.
@@ -314,6 +376,7 @@ impl FlightController for MavFlightController {
         // FSM-owned latching), so this is the only state to clear.
         self.rtb_sent_at_ns.store(0, Ordering::Release);
         self.sever_sent_at_ns.store(0, Ordering::Release);
+        self.sever_echo_baseline.store(0, Ordering::Release);
         tracing::warn!("MAV ACTION: send-time trackers cleared (operator reset)");
         Ok(())
     }
@@ -447,34 +510,58 @@ impl FlightController for MavFlightController {
     }
 
     /// Confirm the autopilot APPLIED the GPS-disable parameter by waiting for
-    /// its PARAM_VALUE echo to read back ≈0, timestamped AFTER our send. This
-    /// closes the gap where best-effort UDP delivered the PARAM_SET but the
-    /// autopilot dropped/NAK'd/ignored it — leaving the drone on spoofed GPS
-    /// even as RTL fires. Returns Ok(true) on confirmed read-back, Ok(false)
-    /// if no causal zero-echo arrives within the window.
+    /// its PARAM_VALUE echo to read back ≈0. This closes the gap where
+    /// best-effort UDP delivered the PARAM_SET but the autopilot
+    /// dropped/NAK'd/ignored it — leaving the drone on spoofed GPS even as RTL
+    /// fires. THREE gates, all required (the sever analogue of `verify_rtb_engaged`'s
+    /// four, hardening audit D1 — the most safety-critical action previously
+    /// confirmed on a SINGLE causal echo while RTL needed four gates):
+    ///
+    /// 1. **Causality**: the latest echo's receipt ns is AFTER our send-time, so
+    ///    a stale/replayed pre-send echo can't confirm.
+    /// 2. **Type match**: the echo's wire `param_type` equals the type we set
+    ///    (`INT8` for ArduPilot `GPS_TYPE`, `INT32` for PX4 `EKF2_GPS_CTRL`) and
+    ///    the value reads ≈0. A forged zero-echo of the wrong type, or a non-zero
+    ///    echo (sever NOT applied), is rejected.
+    /// 3. **Dwell**: the monitor's per-name echo count must have advanced by
+    ///    `SEVER_VERIFY_DWELL_ECHOES` past the count snapshotted at send-time, so a
+    ///    single injected PARAM_VALUE=0 can no longer fake confirmation and suppress
+    ///    the CRITICAL "sever unconfirmed" warning. The count is kept at the
+    ///    *recording* site (`ParamEcho.recv_count`), so several fast echoes that
+    ///    coalesce in the latest-only map are still counted — the verify task only
+    ///    starts polling after every PARAM_SET retry (hence every echo) has landed.
+    ///
+    /// All three are evaluated by the pure `sever_echo_confirms`. Returns Ok(true)
+    /// on a confirmed read-back, Ok(false) otherwise.
     async fn verify_sever_engaged(&self) -> Result<bool, FsError> {
         let sent_at = self.sever_sent_at_ns.load(Ordering::Acquire);
         if sent_at == 0 {
             warn!("MAV SEVER VERIFY called without a prior sever_gps send — refusing to verify");
             return Ok(false);
         }
-        let (name, _ty) = sever_gps_param(self.profile);
+        let baseline = self.sever_echo_baseline.load(Ordering::Acquire);
+        let (name, expected_ty) = sever_gps_param(self.profile);
+        let expected_ty_u8 = expected_ty as u8;
         let deadline = tokio::time::Instant::now() + SEVER_VERIFY_WINDOW;
         loop {
-            if let Some((value, ns)) = self.monitor.last_param_value(name) {
-                if ns > sent_at && value.abs() < SEVER_CONFIRMED_EPS {
+            if let Some(echo) = self.monitor.last_param_value(name) {
+                if sever_echo_confirms(echo, sent_at, baseline, expected_ty_u8) {
                     info!(
                         param = %String::from_utf8_lossy(name),
-                        value,
-                        "MAV SEVER VERIFY: autopilot confirmed GPS aiding disabled (PARAM_VALUE read-back)"
+                        echoes = echo.recv_count.saturating_sub(baseline),
+                        "MAV SEVER VERIFY: autopilot confirmed GPS aiding disabled \
+                         (typed, causal PARAM_VALUE dwell)"
                     );
                     return Ok(true);
                 }
             }
             if tokio::time::Instant::now() >= deadline {
+                let observed = self.monitor.last_param_value(name);
                 warn!(
                     param = %String::from_utf8_lossy(name),
-                    "MAV SEVER VERIFY: no causal zero read-back within window — \
+                    echoes = observed.map(|e| e.recv_count.saturating_sub(baseline)).unwrap_or(0),
+                    last_value = observed.map(|e| e.value).unwrap_or(f32::NAN),
+                    "MAV SEVER VERIFY: no typed causal zero read-back dwell within window — \
                      autopilot may NOT have disabled GPS aiding"
                 );
                 return Ok(false);
@@ -505,5 +592,76 @@ mod tests {
         // Both names must fit MAVLink's fixed 16-byte param_id field.
         assert!(sever_gps_param(VehicleProfile::ArduCopter).0.len() <= 16);
         assert!(sever_gps_param(VehicleProfile::Px4).0.len() <= 16);
+    }
+
+    #[test]
+    fn sever_echo_confirms_requires_all_gates() {
+        // Audit D1: the sever read-back must require causality + type-match +
+        // value≈0 + a multi-echo dwell, so a single injected PARAM_VALUE=0 can
+        // no longer fake confirmation (and suppress the CRITICAL warning) the
+        // way it could when one causal echo sufficed.
+        const TY: u8 = 2; // MAV_PARAM_TYPE_INT8, as ArduPilot GPS_TYPE is set.
+        const WRONG_TY: u8 = 9; // MAV_PARAM_TYPE_REAL32.
+        let sent_at = 1_000u64;
+        let baseline = 5u64; // echoes already seen for this param at send-time.
+        let echo = |value: f32, param_type: u8, recv_ns: u64, recv_count: u64| ParamEcho {
+            value,
+            param_type,
+            recv_ns,
+            recv_count,
+        };
+
+        // Happy path: causal, zero, correct type, dwell met (2 past baseline).
+        assert!(sever_echo_confirms(
+            echo(0.0, TY, sent_at + 1, baseline + 2),
+            sent_at,
+            baseline,
+            TY
+        ));
+        // Float-noise zero within EPS still confirms.
+        assert!(sever_echo_confirms(
+            echo(0.01, TY, sent_at + 1, baseline + 2),
+            sent_at,
+            baseline,
+            TY
+        ));
+        // More than enough echoes still confirms.
+        assert!(sever_echo_confirms(
+            echo(0.0, TY, sent_at + 9, baseline + 3),
+            sent_at,
+            baseline,
+            TY
+        ));
+
+        // Exactly ONE post-send echo — the single-injected-packet case: dwell
+        // NOT met, must NOT confirm.
+        assert!(!sever_echo_confirms(
+            echo(0.0, TY, sent_at + 1, baseline + 1),
+            sent_at,
+            baseline,
+            TY
+        ));
+        // Pre-send (stale / replayed) echo — causality fails even if its count
+        // is far past baseline.
+        assert!(!sever_echo_confirms(
+            echo(0.0, TY, sent_at, baseline + 5),
+            sent_at,
+            baseline,
+            TY
+        ));
+        // Wrong param_type (forged zero of another type) — rejected.
+        assert!(!sever_echo_confirms(
+            echo(0.0, WRONG_TY, sent_at + 1, baseline + 2),
+            sent_at,
+            baseline,
+            TY
+        ));
+        // Non-zero value (sever did NOT take) — rejected even if causal + dwell.
+        assert!(!sever_echo_confirms(
+            echo(1.0, TY, sent_at + 1, baseline + 2),
+            sent_at,
+            baseline,
+            TY
+        ));
     }
 }

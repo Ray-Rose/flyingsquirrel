@@ -309,6 +309,7 @@ impl MavLink {
                                     boot,
                                     &pv.param_id,
                                     pv.param_value,
+                                    pv.param_type as u8,
                                 );
                             }
                             _ => {
