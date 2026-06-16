@@ -33,6 +33,21 @@ pub const G: f64 = 9.806_65;
 /// fallback default for callers that don't override it.
 const DEFAULT_MAX_IMU_DT_S: f32 = 0.10;
 
+/// Multiplier on the nominal IMU inter-sample period used to size the
+/// integration-gap gate (`max_imu_dt_s`). ~2.5 sample periods of slack absorbs
+/// normal link jitter without admitting a meters-scale false position step.
+/// Mirrors the binary's `--imu-rate` startup sizing so the auto-derive below and
+/// the configured value agree when the operator set `--imu-rate` correctly.
+const IMU_GATE_PERIOD_FACTOR: f32 = 2.5;
+
+/// Hard cap on the gate when auto-derived from the observed stream. A real IMU /
+/// autopilot raw-sensor stream is >= ~4 Hz; a stream slow enough to need a gate
+/// beyond this (~2.5 Hz effective) is treated as broken or manipulated and left
+/// to the `DEAD-RECKONING STALLED` warning rather than silently accommodated —
+/// this bounds how far a boot-time cadence manipulation could widen the runtime
+/// stall gate.
+const AUTO_IMU_GATE_MAX_S: f32 = 1.0;
+
 /// Number of consecutive integration-gap skips after which dead-reckoning is
 /// effectively not running and we escalate from a per-step debug line to a
 /// single loud warning. ~1 s of a 25 Hz stream, but capped low so a genuinely
@@ -120,6 +135,11 @@ pub struct DeadReckoner {
     static_init_accum: usize,
     static_init_target: usize,
     static_init_accel_sum: [f64; 3],
+    /// Monotonic-seconds of the FIRST static-init IMU sample. With the last
+    /// init sample (`last_imu_mono` at completion) and the sample count, this
+    /// yields the OBSERVED stream cadence, used to auto-size `max_imu_dt_s` so a
+    /// mis-set `--imu-rate` can't silently fail dead-reckoning open.
+    static_init_first_mono: Option<f64>,
     state: NavStateKind,
     yaw_seeded_from_gps: bool,
     /// Monotonic-seconds of the last GPS fix, for computing the actual
@@ -177,6 +197,7 @@ impl DeadReckoner {
             static_init_accum: 0,
             static_init_target: 0,
             static_init_accel_sum: [0.0; 3],
+            static_init_first_mono: None,
             state: NavStateKind::Normal,
             yaw_seeded_from_gps: false,
             last_gps_mono: None,
@@ -221,6 +242,9 @@ impl DeadReckoner {
             if self.static_init_target == 0 {
                 self.static_init_target =
                     (self.cfg.static_init_s as f64 * 100.0).max(10.0) as usize;
+            }
+            if self.static_init_first_mono.is_none() {
+                self.static_init_first_mono = Some(mono_secs);
             }
             for k in 0..3 {
                 self.static_init_accel_sum[k] += sample.accel_mps2[k] as f64;
@@ -279,6 +303,58 @@ impl DeadReckoner {
                 }
                 self.attitude.init_from_accel(avg);
                 self.initialized = true;
+
+                // Auto-size the IMU integration-gap gate from the OBSERVED
+                // static-init cadence. The binary sizes `max_imu_dt_s` from
+                // `--imu-rate` at startup, but if the operator leaves the 100 Hz
+                // default against a real ~10 Hz autopilot stream the gate is far
+                // too tight: every ~100 ms sample is skipped, dead-reckoning
+                // never runs, and the detector fails OPEN (silently blind). Now
+                // the actual cadence measured during static-init refines the
+                // gate. We only ever WIDEN (never tighten — tightening could
+                // false-trip the stall gate on jitter), and only up to a cap
+                // (an implausibly slow stream is left to the STALLED warning, so
+                // a boot-time cadence manipulation can't widen the runtime stall
+                // gate without bound). This runs once, before any post-init
+                // integration, so runtime stall detection stays sharp.
+                if let (Some(first), Some(last)) = (self.static_init_first_mono, self.last_imu_mono)
+                {
+                    let span = (last - first) as f32;
+                    let intervals = self.static_init_accum.saturating_sub(1);
+                    if span > 0.0 && intervals > 0 {
+                        let observed_period = span / intervals as f32;
+                        let observed_hz = 1.0 / observed_period;
+                        let needed_gate = (IMU_GATE_PERIOD_FACTOR * observed_period)
+                            .clamp(DEFAULT_MAX_IMU_DT_S, AUTO_IMU_GATE_MAX_S);
+                        if needed_gate > self.cfg.max_imu_dt_s {
+                            tracing::warn!(
+                                observed_hz,
+                                observed_period_ms = observed_period * 1000.0,
+                                old_gate_ms = self.cfg.max_imu_dt_s * 1000.0,
+                                new_gate_ms = needed_gate * 1000.0,
+                                "IMU rate auto-derived from the observed stream (~{:.1} Hz): the \
+                                 configured integration-gap gate ({:.0} ms) was too tight and \
+                                 would skip nearly every sample, so dead-reckoning (and the GPS \
+                                 cross-check) would fail OPEN. Widened the gate to {:.0} ms. Set \
+                                 --imu-rate ~{:.0} to match the real stream and silence this.",
+                                observed_hz,
+                                self.cfg.max_imu_dt_s * 1000.0,
+                                needed_gate * 1000.0,
+                                observed_hz,
+                            );
+                            self.cfg.max_imu_dt_s = needed_gate;
+                        } else {
+                            tracing::info!(
+                                observed_hz,
+                                gate_ms = self.cfg.max_imu_dt_s * 1000.0,
+                                "IMU init: observed stream ~{:.1} Hz; integration-gap gate \
+                                 ({:.0} ms) is adequate",
+                                observed_hz,
+                                self.cfg.max_imu_dt_s * 1000.0,
+                            );
+                        }
+                    }
+                }
             }
             return Ok(None);
         }
@@ -784,5 +860,82 @@ mod tests {
         };
         // No expected_home configured -> always plausible (operator opted out).
         assert!(nav.is_first_fix_plausible(&any_fix).is_ok());
+    }
+
+    /// Drive a `DeadReckoner` through static-init with `samples` level, at-rest
+    /// IMU samples spaced `dt` seconds apart, and return it post-init so the
+    /// auto-derived `max_imu_dt_s` can be asserted. `static_init_target` is
+    /// `static_init_s * 100` (= 100 at the default), so 100 samples complete it.
+    fn drive_static_init(dt: f64) -> DeadReckoner {
+        use crate::types::{ImuSample, Timestamp};
+        use std::time::Duration;
+        use tokio::time::Instant;
+        let boot = Instant::now();
+        let mut dr = DeadReckoner::new(NavConfig::default(), boot);
+        for i in 0..100 {
+            let s = ImuSample {
+                t: Timestamp {
+                    mono: boot + Duration::from_secs_f64(i as f64 * dt),
+                    utc: None,
+                },
+                // Level, at rest: specific force is −g on Down (what real IMUs and
+                // ArduPilot/PX4 emit), passes the boot gravity sanity gate.
+                accel_mps2: [0.0, 0.0, -9.806_65],
+                gyro_rps: [0.0, 0.0, 0.0],
+            };
+            let _ = dr.step(&s);
+        }
+        assert!(
+            dr.initialized,
+            "static-init should complete after 100 samples"
+        );
+        dr
+    }
+
+    #[test]
+    fn imu_gate_auto_widens_on_slow_stream() {
+        // The footgun: configured gate is the 100 ms default (--imu-rate left at
+        // 100) but the real stream is ~9 Hz (110 ms). Without the auto-derive
+        // every sample's gap exceeds the gate -> dead-reckoning never runs and
+        // the detector fails OPEN. The observed cadence must widen the gate.
+        assert!((NavConfig::default().max_imu_dt_s - 0.10).abs() < 1e-6);
+        let dr = drive_static_init(0.110);
+        assert!(
+            dr.cfg.max_imu_dt_s > 0.10,
+            "gate must widen for a slow stream, got {} ms",
+            dr.cfg.max_imu_dt_s * 1000.0
+        );
+        // ~2.5 × 110 ms = 275 ms.
+        assert!(
+            (dr.cfg.max_imu_dt_s - 0.275).abs() < 0.03,
+            "gate should be ~275 ms, got {} ms",
+            dr.cfg.max_imu_dt_s * 1000.0
+        );
+    }
+
+    #[test]
+    fn imu_gate_not_widened_on_fast_stream() {
+        // A 100 Hz stream (10 ms): 2.5 × 10 ms = 25 ms is below the 100 ms floor,
+        // so the gate stays at the default — no spurious widening.
+        let dr = drive_static_init(0.010);
+        assert!(
+            (dr.cfg.max_imu_dt_s - 0.10).abs() < 1e-6,
+            "gate should stay at the 100 ms default for a fast stream, got {} ms",
+            dr.cfg.max_imu_dt_s * 1000.0
+        );
+    }
+
+    #[test]
+    fn imu_gate_widen_is_capped_for_implausibly_slow_stream() {
+        // ~1.4 Hz (700 ms): 2.5 × 700 ms = 1.75 s would widen without bound; the
+        // cap holds it at AUTO_IMU_GATE_MAX_S so a boot-time cadence manipulation
+        // can't open the runtime stall gate arbitrarily.
+        let dr = drive_static_init(0.700);
+        assert!(
+            (dr.cfg.max_imu_dt_s - AUTO_IMU_GATE_MAX_S).abs() < 1e-6,
+            "gate should be capped at {} s, got {} s",
+            AUTO_IMU_GATE_MAX_S,
+            dr.cfg.max_imu_dt_s
+        );
     }
 }

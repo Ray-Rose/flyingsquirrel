@@ -434,6 +434,26 @@ async fn run() -> Result<(), FsError> {
     };
 
     // --- Build IMU source ---
+    // `--imu-axis-map` only applies on the I2C path (it remaps the raw chip
+    // axes into the body FRD frame). On the MAV path the autopilot has already
+    // rotated SCALED_IMU / HIGHRES_IMU into its FRD body frame, so the remap is
+    // a SILENT no-op there — warn loudly rather than let an operator believe a
+    // non-FRD MAV mounting is being corrected when it is not.
+    if cli.imu_source == ImuSourceKind::Mav {
+        let identity_map = flyingsquirrel::hw::axis_map::AxisMap::parse(&cli.imu_axis_map)
+            .map(|m| m.is_identity())
+            .unwrap_or(false);
+        if !identity_map {
+            tracing::warn!(
+                axis_map = %cli.imu_axis_map,
+                "--imu-axis-map is IGNORED on the MAVLink IMU path: SCALED_IMU / HIGHRES_IMU \
+                 already arrive in the autopilot's FRD body frame (the autopilot applies the \
+                 board-orientation correction), so the axis remap applies ONLY to the raw I2C \
+                 IMU (--imu-source i2c). Remove --imu-axis-map for a MAV deployment, or the \
+                 remap you intend will silently not happen."
+            );
+        }
+    }
     let imu: Box<dyn ImuSource> = match cli.imu_source {
         ImuSourceKind::Synth => Box::new(build_synth_imu(&cli)),
         ImuSourceKind::Mav => Box::new(MavImuSource {
@@ -471,7 +491,11 @@ async fn run() -> Result<(), FsError> {
     // ArduPilot/PX4 link produces (the detector then fails open). Allow ~2.5
     // nominal sample periods of jitter, but never tighter than the default. For
     // a MAV deployment, set --imu-rate to the autopilot's raw-sensor stream rate
-    // (ArduPilot SR2_RAW_SENS / PX4 equivalent).
+    // (ArduPilot SR2_RAW_SENS / PX4 equivalent). This is the INITIAL sizing; the
+    // nav stack additionally auto-derives the gate from the cadence it actually
+    // observes during static-init and WIDENS it if this configured value is too
+    // tight (so a forgotten/mis-set --imu-rate can't silently fail the detector
+    // open — see DeadReckoner::step's auto-size block).
     let nominal_imu_period_s: f32 = if cli.imu_rate > 0.0 {
         1.0 / cli.imu_rate
     } else {
