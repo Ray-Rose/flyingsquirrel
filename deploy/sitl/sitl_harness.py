@@ -147,6 +147,20 @@ class Relay:
         self.ekf_flags = None
         self.ekf_vel_var = None
         self.ekf_pos_horiz_var = None
+        # Latest TRUE (un-spoofed) position from GLOBAL_POSITION_INT, tracked by
+        # the relay thread BEFORE the spoof rewrite. Feeds the external-vision
+        # fallback (PX4 ActionAcked): when `ev_active`, the relay streams
+        # VISION_POSITION_ESTIMATE to PX4 at ~30 Hz so PX4 retains a NON-GPS
+        # position source and can hold an armed RTL through the detector's verify
+        # dwell AFTER the GPS sever (EKF2_GPS_CTRL=0 otherwise removes PX4's only
+        # position -> LAND -> disarm -> the detector's armed cross-check correctly
+        # reports ActionUnconfirmed). The EV stream goes ONLY harness->PX4; the
+        # detector never sees it, so detection is unaffected.
+        self.true_lat = None
+        self.true_lon = None
+        self.ev_active = False
+        self.ev_origin = None  # (lat0, lon0) captured when EV is enabled
+        self._last_ev_send = 0.0
 
     def _current_spoof_offset(self):
         """(dlat_deg, dlon_deg, dvel_e_mps) for this instant. The step relay
@@ -235,6 +249,11 @@ class Relay:
                     self.gps_sats = msg.satellites_visible
                 elif mt == "GLOBAL_POSITION_INT":
                     self.rel_alt_m = msg.relative_alt / 1000.0
+                    # TRUE position — read BEFORE _maybe_spoof_and_serialize
+                    # rewrites msg.lat/lon below, so the EV fallback feeds PX4
+                    # its real position, not the spoofed one.
+                    self.true_lat = msg.lat / 1e7
+                    self.true_lon = msg.lon / 1e7
                 elif mt == "EKF_STATUS_REPORT":
                     self.ekf_flags = msg.flags
                     self.ekf_vel_var = msg.velocity_variance
@@ -261,7 +280,51 @@ class Relay:
                     self._fwd_to_sitl += 1
                 except Exception:
                     pass
+            # 3) External-vision fallback: stream VISION_POSITION_ESTIMATE to PX4
+            #    at ~30 Hz from the TRUE position (NED relative to the EV origin),
+            #    so PX4 has a non-GPS position source through the verify dwell.
+            if self.ev_active and self.ev_origin is not None and self.true_lat is not None:
+                now = time.time()
+                if now - self._last_ev_send >= 1.0 / 30.0:
+                    self._last_ev_send = now
+                    self._send_ev()
             time.sleep(0.002)
+
+    def _send_ev(self):
+        """Send one VISION_POSITION_ESTIMATE (NED rel. to ev_origin) to PX4."""
+        lat0, lon0 = self.ev_origin
+        north = (self.true_lat - lat0) * 111320.0
+        east = (self.true_lon - lon0) * 111320.0 * math.cos(math.radians(lat0))
+        down = -self.rel_alt_m
+        usec = int(time.time() * 1e6)
+        # 21-element upper-triangular 6x6 pose covariance; small diagonals =
+        # high confidence so the EKF fuses it. Diagonal indices: 0,6,11,15,18,20.
+        cov = [0.0] * 21
+        cov[0] = cov[6] = cov[11] = 0.01  # x,y,z position variance (m^2)
+        cov[15] = cov[18] = cov[20] = 0.05  # roll,pitch,yaw variance
+        # Send as a GCS/companion sysid, not the autopilot's, so PX4 treats it as
+        # an external source. (Sequential within this thread with the spoof
+        # re-encode, which sets srcSystem right before it packs.)
+        self.sitl.mav.srcSystem = 255
+        self.sitl.mav.srcComponent = 200
+        # The VISION_POSITION_ESTIMATE covariance + reset_counter are MAVLink2
+        # EXTENSION fields whose presence in the generated `_send` signature varies
+        # by pymavlink version. Try the modern 9-arg form (with covariance), then
+        # fall back to the 7-arg form — and swallow EVERYTHING, because an
+        # unhandled exception here would kill the relay pump thread and stop ALL
+        # forwarding. (EKF2_EV_NOISE_MD=0 + EKF2_EVP_NOISE makes the EKF use a
+        # param-based noise, so the message covariance isn't load-bearing anyway.)
+        for send in (
+            lambda: self.sitl.mav.vision_position_estimate_send(
+                usec, north, east, down, 0.0, 0.0, 0.0, cov, 0),
+            lambda: self.sitl.mav.vision_position_estimate_send(
+                usec, north, east, down, 0.0, 0.0, 0.0),
+        ):
+            try:
+                send()
+                return
+            except Exception:
+                continue
 
     # --- choreography helpers (run on main thread) ---
     def wait_gps(self, timeout=180):
@@ -302,6 +365,20 @@ class Relay:
             self.sitl.target_system, self.sitl.target_component,
             name.encode("ascii"), float(value),
             mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
+
+    def enable_ev_fallback(self):
+        """Capture the current true position as the EV origin and begin streaming
+        VISION_POSITION_ESTIMATE (see _pump / _send_ev). The caller sets the
+        EKF2 params that make PX4 fuse it. Returns False if no position is known
+        yet (the EV origin couldn't be captured)."""
+        if self.true_lat is None:
+            log("WARN: no GLOBAL_POSITION_INT seen yet — EV fallback NOT started")
+            return False
+        self.ev_origin = (self.true_lat, self.true_lon)
+        self.ev_active = True
+        log("EV fallback ON: streaming VISION_POSITION_ESTIMATE @30Hz from origin "
+            "({:.7f},{:.7f})".format(self.true_lat, self.true_lon))
+        return True
 
     def ekf_summary(self):
         """Human-readable EKF_STATUS_REPORT snapshot. Flag bits are the stable
@@ -358,6 +435,15 @@ def main():
     # ArduCopter GUIDED = custom_mode 4; PX4 doesn't use that path (we just
     # arm + let it hold), so the value is harmless there.
     ap.add_argument("--vehicle", choices=["ardu-copter", "px4"], default="ardu-copter")
+    # PX4 ActionAcked fallback (experimental, opt-in). When set on a PX4 run, the
+    # harness configures EKF2 to fuse external vision and streams a true-position
+    # VISION_POSITION_ESTIMATE, so PX4 keeps a NON-GPS position estimate after the
+    # detector severs EKF2_GPS_CTRL=0 and can hold an armed RTL through the verify
+    # dwell -> the detector's STRONG ActionAcked read-back (vs ActionUnconfirmed
+    # when PX4 LANDs+disarms for lack of position). The detector is unchanged.
+    ap.add_argument("--px4-ev-fallback", action="store_true",
+                    help="PX4 only: inject external-vision position so PX4 holds "
+                         "armed RTL after the GPS sever (enables ActionAcked).")
     args = ap.parse_args()
 
     # Param mode needs the watch window to outlast the ramp plus a detection
@@ -464,6 +550,32 @@ def main():
     # detector's read-back dwell (descending from altitude takes >> the 5 s
     # verify window, so it stays armed long enough to confirm ActionAcked).
     r.wait_airborne(args.takeoff_alt * 0.5)
+
+    # PX4 ActionAcked fallback: give PX4 a non-GPS position source so it can hold
+    # an armed RTL after the detector severs GPS (otherwise PX4 loses position ->
+    # LANDs+disarms -> the detector's armed cross-check correctly returns
+    # ActionUnconfirmed, the C-15 trade-off). Configure EKF2 to fuse external
+    # vision, then stream a true-position VISION_POSITION_ESTIMATE (the relay
+    # thread, _send_ev). Opt-in + PX4-only; the detector is untouched.
+    if is_px4 and args.px4_ev_fallback:
+        # EKF2_EV_CTRL is the modern (>=1.13) external-vision bitmask:
+        #   bit0(1)=horizontal position, bit1(2)=vertical position,
+        #   bit2(4)=velocity, bit3(8)=yaw. 11 = horiz+vert pos + yaw.
+        # EKF2_AID_MASK is the pre-1.13 equivalent (bit3=8 -> vision position);
+        # set both, the param that doesn't exist on this firmware is ignored
+        # (same dual-name tactic the param-mode SIM_GPS ramp uses).
+        log("PX4 EV fallback: EKF2_EV_CTRL=11 + EKF2_AID_MASK|=8 (fuse external vision)")
+        for _ in range(3):
+            r.set_param("EKF2_EV_CTRL", 11)
+            r.set_param("EKF2_AID_MASK", 9)  # 1 (GPS) | 8 (EV position)
+            r.set_param("EKF2_EV_NOISE_MD", 0)  # use the param noise below, not msg cov
+            r.set_param("EKF2_EVP_NOISE", 0.1)  # 0.1 m EV position noise (high confidence)
+            time.sleep(0.5)
+        if r.enable_ev_fallback():
+            # Let the EKF fuse EV alongside GPS for a few seconds before the
+            # spoof, so the EV lane is already converged when GPS is severed.
+            log("EV fallback: letting EKF converge on vision for 8 s before the spoof")
+            time.sleep(8)
 
     log("clean flight window {} s (detector should stay Normal, preflight Ready)".format(
         args.clean_secs))

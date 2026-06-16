@@ -9,8 +9,12 @@ name: PX4 SITL bring-up (smoke)
 #
 # Nightly + on-demand, like sitl.yml (the ArduPilot loop). PX4 SITL is a heavier
 # third-party Gazebo image, so this is a separate workflow on its own schedule.
-# Both jobs (bring-up smoke + closed loop) are validated green; the closed loop
-# is detector-gated (Spoofed + RTL action + PX4 reaching AUTO.RTL).
+# The bring-up smoke + closed-loop jobs are validated green; the closed loop is
+# detector-gated (Spoofed + RTL action + PX4 reaching AUTO.RTL). A third,
+# NON-GATING job (px4-action-acked) exercises the experimental external-vision
+# fallback that lets PX4 hold an armed RTL through the verify dwell -> the
+# stronger ActionAcked read-back; continue-on-error keeps it from ever regressing
+# the proven closed-loop gate while the EV-fusion setup is iterated.
 on:
   schedule:
     - cron: "47 7 * * *" # ~07:47 UTC nightly (offset from sitl.yml's 07:17)
@@ -67,5 +71,41 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: px4-closed-loop-output
+          path: deploy/sitl/last-run/
+          if-no-files-found: ignore
+
+  px4-action-acked:
+    name: PX4 SITL ActionAcked (EV fallback, experimental)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # NON-GATING: the external-vision fusion setup (EKF2_EV_CTRL + VISION_POSITION_
+    # ESTIMATE injection) may need iteration against live PX4, and we must NEVER let
+    # it regress the proven px4-closed-loop gate above. This leg proves the STRONGER
+    # ActionAcked read-back: with a non-GPS position source, PX4 holds an armed RTL
+    # through the detector's verify dwell after the GPS sever (without it, PX4 loses
+    # position -> LANDs+disarms -> the detector's armed cross-check correctly returns
+    # ActionUnconfirmed — the C-15 trade-off; the detector is unchanged either way).
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build detector image (flyingsquirrel:sitl)
+        run: docker build -f deploy/Dockerfile -t flyingsquirrel:sitl .
+
+      - name: PX4 closed-loop validation with EV fallback (assert ActionAcked)
+        env:
+          PX4_EV_FALLBACK: "1"
+          REQUIRE_ACTION_ACKED: "1"
+        run: bash deploy/sitl/run-px4-validation.sh
+
+      - name: Make detector output readable for upload
+        if: always()
+        run: sudo chmod -R a+r deploy/sitl/last-run/ 2>/dev/null || true
+
+      - name: Upload detector event log + forensic dumps
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: px4-action-acked-output
           path: deploy/sitl/last-run/
           if-no-files-found: ignore

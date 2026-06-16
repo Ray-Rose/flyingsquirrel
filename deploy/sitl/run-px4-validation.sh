@@ -30,6 +30,14 @@ SPOOF_MODE="${SPOOF_MODE:-relay}"
 GLITCH_RAMP_SECS="${GLITCH_RAMP_SECS:-60}"
 DETECTOR_DURATION="${DETECTOR_DURATION:-320}"
 IMU_RATE="${IMU_RATE:-50}"
+# Experimental PX4 ActionAcked path (opt-in). When set, the harness injects an
+# external-vision position so PX4 keeps a non-GPS position estimate after the GPS
+# sever and can hold an armed RTL through the detector's verify dwell. The proven
+# closed-loop gate does NOT use this; it is exercised only by a non-gating CI leg.
+PX4_EV_FALLBACK="${PX4_EV_FALLBACK:-}"
+# When set, PASS additionally requires the STRONG ActionAcked read-back (not just
+# a commanded RTL). Used by the experimental EV-fallback leg.
+REQUIRE_ACTION_ACKED="${REQUIRE_ACTION_ACKED:-}"
 # Seconds to let PX4 boot (Gazebo headless) + GPS-lock before the harness begins
 # its choreography. PX4 is slower to come up than ArduPilot's in-process sim.
 PX4_BOOT_SECS="${PX4_BOOT_SECS:-75}"
@@ -79,6 +87,12 @@ docker run -d --name fs-px4 --network "$NET" "$PX4_IMAGE" "$HARNESS_IP" >/dev/nu
 echo "[px4] letting PX4 boot + GPS-lock for ${PX4_BOOT_SECS}s before choreography..."
 sleep "$PX4_BOOT_SECS"
 
+EV_ARG=""
+if [[ -n "$PX4_EV_FALLBACK" ]]; then
+    EV_ARG="--px4-ev-fallback"
+    echo "[px4] EV fallback ENABLED (experimental ActionAcked path)"
+fi
+
 echo "[px4] launching harness at $HARNESS_IP (binds udpin:14540, flies PX4, spoofs, watches)"
 set +e
 docker run --rm --name fs-harness --network "$NET" --ip "$HARNESS_IP" \
@@ -88,7 +102,7 @@ docker run --rm --name fs-harness --network "$NET" --ip "$HARNESS_IP" \
     --vehicle px4 \
     --glitch-m "$GLITCH_M" --home-lat "$HOME_LAT" \
     --spoof-mode "$SPOOF_MODE" --glitch-ramp-secs "$GLITCH_RAMP_SECS" \
-    --clean-secs "$CLEAN_SECS" --watch-secs "$WATCH_SECS"
+    --clean-secs "$CLEAN_SECS" --watch-secs "$WATCH_SECS" $EV_ARG
 HARNESS_RC=$?
 set -e
 
@@ -127,9 +141,28 @@ fi
 
 echo ""
 echo "[px4] harness exit code: $HARNESS_RC  (0=closed-loop RTL verified, 3=no RTL in window, 2=setup)"
-# Same gate as the ArduPilot loop: detector did the work (Spoofed + RTL action)
-# AND the autopilot reached an RTL-equivalent (harness RC 0).
-if [[ "$HARNESS_RC" -eq 0 && $DET_SPOOFED -eq 0 && $DET_RTB -eq 0 ]]; then
+# Base closed-loop gate (same as the ArduPilot loop): detector did the work
+# (Spoofed + RTL action) AND the autopilot reached an RTL-equivalent (harness RC 0).
+BASE_OK=1
+[[ "$HARNESS_RC" -eq 0 && $DET_SPOOFED -eq 0 && $DET_RTB -eq 0 ]] && BASE_OK=0
+
+if [[ -n "$REQUIRE_ACTION_ACKED" ]]; then
+    # Experimental EV-fallback leg: PASS requires the STRONG ActionAcked read-back
+    # (PX4 held an armed RTL through the verify dwell), not just a commanded RTL.
+    if [[ $BASE_OK -eq 0 && $DET_ACKED -eq 0 ]]; then
+        echo "[px4] PASS: PX4 closed loop + STRONG ActionAcked read-back verified (EV fallback held PX4 armed through the dwell)."
+        exit 0
+    fi
+    if [[ $BASE_OK -eq 0 ]]; then
+        echo "[px4] PARTIAL: closed loop verified but ActionAcked NOT reached — the EV fallback likely needs tuning (PX4 may still have LANDed/disarmed for lack of a fused vision position). Inspect $OUT_DIR."
+        exit 3
+    fi
+    echo "[px4] FAIL: closed loop not verified (harness_rc=$HARNESS_RC spoofed=$DET_SPOOFED rtb=$DET_RTB)."
+    exit "${HARNESS_RC:-1}"
+fi
+
+# Default (proven) closed-loop gate — unchanged.
+if [[ $BASE_OK -eq 0 ]]; then
     echo "[px4] PASS: PX4 closed loop verified — detector detected + commanded RTL; PX4 reached RTL-equivalent."
     exit 0
 fi

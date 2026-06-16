@@ -399,6 +399,21 @@ and the closed-loop gate passes. Two concrete answers to the open questions:
   through the verify dwell — a deferred follow-up. (ArduCopter holds armed RTL
   because its EKF tolerates the `GPS_TYPE=0` sever differently and stays
   navigable.)
+- **ActionAcked path (experimental, non-gating CI).** The detector is correct —
+  `ActionUnconfirmed` on a disarming autopilot is the deliberate C-15 safety
+  trade-off (relaxing the armed gate would weaken the W-ARMED defence), so the
+  fix is harness-side, not detector-side. `sitl_harness.py --px4-ev-fallback`
+  configures EKF2 to fuse external vision (`EKF2_EV_CTRL=11` / `EKF2_AID_MASK|=8`)
+  and streams a **true-position** `VISION_POSITION_ESTIMATE` at ~30 Hz (NED
+  relative to a captured origin; the EV goes only harness→PX4, the detector never
+  sees it). With a non-GPS position source, PX4 should hold an armed RTL after the
+  `EKF2_GPS_CTRL=0` sever and the read-back should reach `ActionAcked`. This runs
+  as a **`continue-on-error`** job (`px4-action-acked` in
+  [`sitl-px4.yml`](../.github/workflows/sitl-px4.yml)) with `REQUIRE_ACTION_ACKED=1`
+  so it can never regress the proven `px4-closed-loop` gate while the EV-fusion
+  setup is tuned. **Status: implemented, pending nightly-CI validation** — PX4
+  SITL can't run on the Windows dev box, so the EKF2-EV params / message frames
+  may need an iteration or two against the live Gazebo image.
 
 ## When SITL passes, what's next
 
