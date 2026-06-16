@@ -159,6 +159,12 @@ impl MavLink {
             // check" warning, so a 1 Hz autopilot HEARTBEAT from the wrong
             // port doesn't spam the log every second.
             let mut last_port_deaf_warn: Option<Instant> = None;
+            // Per-stream clock aligners map the autopilot's own sensor
+            // timestamps onto our monotonic clock so link jitter doesn't shift
+            // GPS vs IMU and inject residual. They fall back to arrival time on
+            // any anomaly (see `ClockAligner`).
+            let mut gps_aligner = ClockAligner::default();
+            let mut imu_aligner = ClockAligner::default();
             loop {
                 let (n, src) = match sock.recv_from(&mut buf).await {
                     Ok(v) => v,
@@ -323,7 +329,11 @@ impl MavLink {
                             }
                         }
 
-                        if let Some(fix) = gps_from_msg(&msg) {
+                        if let Some(mut fix) = gps_from_msg(&msg) {
+                            // Replace the parse-time arrival stamp with a
+                            // sensor-time-aligned monotonic instant so link
+                            // jitter doesn't move the GPS↔IMU residual alignment.
+                            fix.t.mono = gps_aligner.align(gps_sensor_us(&msg), Instant::now());
                             // Reject non-finite / out-of-range values (defense in depth).
                             if !gps_fix_is_plausible(&fix) {
                                 stats.dropped_nonfinite.fetch_add(1, Ordering::Relaxed);
@@ -333,7 +343,8 @@ impl MavLink {
                             if gps_tx.send(fix).await.is_err() {
                                 break;
                             }
-                        } else if let Some(sample) = imu_from_msg(&msg) {
+                        } else if let Some(mut sample) = imu_from_msg(&msg) {
+                            sample.t.mono = imu_aligner.align(imu_sensor_us(&msg), Instant::now());
                             if !imu_sample_is_plausible(&sample) {
                                 stats.dropped_nonfinite.fetch_add(1, Ordering::Relaxed);
                                 debug!(src = %src, "dropped mavlink IMU: implausible values");
@@ -592,6 +603,102 @@ pub fn imu_from_msg(msg: &MavMessage) -> Option<ImuSample> {
                 i.zgyro as f32 * 1e-3,
             ],
         }),
+        _ => None,
+    }
+}
+
+/// Maximum |arrival − aligned| skew the clock aligner tolerates before it
+/// distrusts the autopilot's sensor clock and re-anchors (falling back to
+/// arrival time). Real link jitter / latency spikes are tens to a few hundred
+/// ms; a skew beyond this means the sensor clock isn't tracking wall time
+/// (different tick rate, reboot, or wrap), so we re-anchor rather than feed a
+/// wild timestamp into the residual buffer.
+const CLOCK_ALIGN_MAX_SKEW: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Maps an autopilot per-stream sensor timestamp onto the local monotonic clock,
+/// removing per-message ARRIVAL jitter from the GPS↔IMU residual alignment.
+///
+/// Both GPS (`GPS_RAW_INT.time_usec`) and IMU (`HIGHRES_IMU.time_usec` /
+/// `SCALED_IMU*.time_boot_ms`) carry the autopilot's own sensor timestamps. The
+/// detector previously stamped both at PARSE time (`now_mono()`), so any jitter
+/// in the USB / UART / SiK / UDP path between the autopilot and the companion
+/// computer shifted GPS and IMU relative to each other and injected residual
+/// (~0.75 m per 50 ms of differential jitter at 15 m/s) — invisible on SITL
+/// loopback, a real risk on a real link. This aligner anchors each stream on the
+/// local arrival of its FIRST message and advances by the SENSOR-reported deltas
+/// thereafter, so per-message jitter no longer moves the alignment; only one
+/// constant offset (the first message's latency) remains, which the detector's
+/// adaptive noise floor absorbs.
+///
+/// SAFE BY CONSTRUCTION: on any anomaly — no sensor timestamp, a regression
+/// (reboot / wrap / reorder), or a skew from arrival beyond
+/// `CLOCK_ALIGN_MAX_SKEW` (the sensor clock isn't tracking wall time) — it falls
+/// back to arrival time, i.e. exactly the prior behavior. It is PER-STREAM
+/// because the GPS and IMU clocks may use different bases (boot-relative vs UNIX
+/// epoch); mapping each stream by its OWN deltas cancels the absolute base.
+#[derive(Debug, Default)]
+struct ClockAligner {
+    /// (local arrival Instant, sensor µs) captured at the current anchor.
+    anchor: Option<(Instant, u64)>,
+}
+
+impl ClockAligner {
+    /// Local-monotonic Instant to stamp on a message whose autopilot sensor
+    /// timestamp is `sensor_us` (None if absent) and that arrived at `arrival`.
+    fn align(&mut self, sensor_us: Option<u64>, arrival: Instant) -> Instant {
+        let Some(s) = sensor_us else {
+            // No usable sensor timestamp → arrival time. Leave the anchor intact
+            // so one missing stamp doesn't reset the established alignment.
+            return arrival;
+        };
+        match self.anchor {
+            None => {
+                self.anchor = Some((arrival, s));
+                arrival
+            }
+            Some((anchor_arrival, anchor_sensor)) => {
+                if s < anchor_sensor {
+                    // Sensor clock regressed (reboot / wrap / reorder) →
+                    // re-anchor and use arrival for this message.
+                    self.anchor = Some((arrival, s));
+                    return arrival;
+                }
+                let aligned = anchor_arrival + std::time::Duration::from_micros(s - anchor_sensor);
+                // Aligned must stay within CLOCK_ALIGN_MAX_SKEW of arrival; past
+                // that the sensor clock isn't tracking wall time, so re-anchor.
+                let skew = aligned
+                    .saturating_duration_since(arrival)
+                    .max(arrival.saturating_duration_since(aligned));
+                if skew > CLOCK_ALIGN_MAX_SKEW {
+                    self.anchor = Some((arrival, s));
+                    return arrival;
+                }
+                aligned
+            }
+        }
+    }
+}
+
+/// The autopilot's per-stream sensor timestamp (µs) for a GPS message, or None
+/// if absent (`time_usec = 0`, the "unknown" sentinel). The absolute base
+/// (boot-relative or UNIX epoch) doesn't matter — `ClockAligner` uses per-message
+/// deltas, so the base cancels.
+fn gps_sensor_us(msg: &MavMessage) -> Option<u64> {
+    match msg {
+        MavMessage::GPS_RAW_INT(g) if g.time_usec != 0 => Some(g.time_usec),
+        _ => None,
+    }
+}
+
+/// The autopilot's per-stream sensor timestamp (µs) for an IMU message, or None
+/// if absent. `HIGHRES_IMU.time_usec` is already µs; `SCALED_IMU*` carry
+/// `time_boot_ms` (ms since boot) → ×1000.
+fn imu_sensor_us(msg: &MavMessage) -> Option<u64> {
+    match msg {
+        MavMessage::HIGHRES_IMU(i) if i.time_usec != 0 => Some(i.time_usec),
+        MavMessage::SCALED_IMU(i) if i.time_boot_ms != 0 => Some(i.time_boot_ms as u64 * 1000),
+        MavMessage::SCALED_IMU2(i) if i.time_boot_ms != 0 => Some(i.time_boot_ms as u64 * 1000),
+        MavMessage::SCALED_IMU3(i) if i.time_boot_ms != 0 => Some(i.time_boot_ms as u64 * 1000),
         _ => None,
     }
 }
@@ -963,5 +1070,125 @@ mod plausibility_tests {
         assert!((s.accel_mps2[0] - 1.5).abs() < 1e-6);
         assert!((s.accel_mps2[2] - 9.80665).abs() < 1e-5);
         assert!((s.gyro_rps[1] - 0.1).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod clock_align_tests {
+    use super::*;
+    use mavlink::common::{GPS_RAW_INT_DATA, HIGHRES_IMU_DATA, SCALED_IMU_DATA};
+    use std::time::Duration;
+
+    #[test]
+    fn aligner_first_message_uses_arrival_and_anchors() {
+        let mut a = ClockAligner::default();
+        let t0 = Instant::now();
+        // Regardless of the sensor value, the first message stamps arrival time.
+        assert_eq!(a.align(Some(1_000_000), t0), t0);
+    }
+
+    #[test]
+    fn aligner_removes_arrival_jitter() {
+        let mut a = ClockAligner::default();
+        let t0 = Instant::now();
+        assert_eq!(a.align(Some(1_000_000), t0), t0); // anchor
+                                                      // Sensor advanced +100 ms, but this message arrived 30 ms LATE (link
+                                                      // jitter). The aligned stamp must track the SENSOR delta, not arrival.
+        let arrival = t0 + Duration::from_millis(130);
+        let aligned = a.align(Some(1_100_000), arrival);
+        assert_eq!(aligned, t0 + Duration::from_millis(100));
+        assert_ne!(
+            aligned, arrival,
+            "the 30 ms of arrival jitter must be removed"
+        );
+    }
+
+    #[test]
+    fn aligner_tolerates_latency_spike_within_bound() {
+        // A one-off latency spike WITHIN CLOCK_ALIGN_MAX_SKEW is CORRECTED (the
+        // aligned stamp tracks the sensor), not mistaken for a clock fault — this
+        // is the whole point: removing exactly this jitter from the residual.
+        let mut a = ClockAligner::default();
+        let t0 = Instant::now();
+        a.align(Some(1_000_000), t0);
+        // Sensor +500 ms, arrival +1500 ms (a 1 s spike) → skew 1 s < 2 s bound.
+        let aligned = a.align(Some(1_500_000), t0 + Duration::from_millis(1500));
+        assert_eq!(aligned, t0 + Duration::from_millis(500));
+    }
+
+    #[test]
+    fn aligner_missing_sensor_ts_uses_arrival_without_disturbing_anchor() {
+        let mut a = ClockAligner::default();
+        let t0 = Instant::now();
+        a.align(Some(1_000_000), t0); // anchor
+                                      // A message with no sensor timestamp → arrival time, anchor untouched.
+        let arrival = t0 + Duration::from_millis(100);
+        assert_eq!(a.align(None, arrival), arrival);
+        // The next good message still aligns against the ORIGINAL anchor.
+        let aligned = a.align(Some(1_200_000), t0 + Duration::from_millis(999));
+        assert_eq!(aligned, t0 + Duration::from_millis(200));
+    }
+
+    #[test]
+    fn aligner_re_anchors_on_sensor_regression() {
+        let mut a = ClockAligner::default();
+        let t0 = Instant::now();
+        a.align(Some(5_000_000), t0); // anchor at sensor = 5 s
+                                      // Sensor went BACKWARDS (autopilot reboot / counter wrap) → fall back to
+                                      // arrival and re-anchor on the new base.
+        let arrival = t0 + Duration::from_millis(100);
+        assert_eq!(a.align(Some(1_000_000), arrival), arrival);
+        // Subsequent messages align against the NEW anchor.
+        let aligned = a.align(Some(1_050_000), t0 + Duration::from_millis(900));
+        assert_eq!(aligned, arrival + Duration::from_millis(50));
+    }
+
+    #[test]
+    fn aligner_re_anchors_on_implausible_skew() {
+        let mut a = ClockAligner::default();
+        let t0 = Instant::now();
+        a.align(Some(1_000_000), t0); // anchor
+                                      // Sensor jumped +10 s but arrival only advanced 100 ms: a ~9.9 s skew,
+                                      // far beyond CLOCK_ALIGN_MAX_SKEW → the sensor clock isn't tracking wall
+                                      // time (base mismatch / garbage), so distrust it and use arrival.
+        let arrival = t0 + Duration::from_millis(100);
+        assert_eq!(a.align(Some(11_000_000), arrival), arrival);
+    }
+
+    #[test]
+    fn gps_sensor_us_reads_time_usec() {
+        let g = MavMessage::GPS_RAW_INT(GPS_RAW_INT_DATA {
+            time_usec: 7_000_000,
+            ..Default::default()
+        });
+        assert_eq!(gps_sensor_us(&g), Some(7_000_000));
+        // The 0 "unknown" sentinel → None (the aligner then uses arrival time).
+        let z = MavMessage::GPS_RAW_INT(GPS_RAW_INT_DATA {
+            time_usec: 0,
+            ..Default::default()
+        });
+        assert_eq!(gps_sensor_us(&z), None);
+    }
+
+    #[test]
+    fn imu_sensor_us_reads_per_message_type() {
+        // HIGHRES_IMU.time_usec is already µs.
+        let hr = MavMessage::HIGHRES_IMU(HIGHRES_IMU_DATA {
+            time_usec: 4_200_000,
+            ..Default::default()
+        });
+        assert_eq!(imu_sensor_us(&hr), Some(4_200_000));
+        // SCALED_IMU.time_boot_ms is ms → ×1000.
+        let si = MavMessage::SCALED_IMU(SCALED_IMU_DATA {
+            time_boot_ms: 5_000,
+            ..Default::default()
+        });
+        assert_eq!(imu_sensor_us(&si), Some(5_000_000));
+        // Zero sentinel → None.
+        let z = MavMessage::SCALED_IMU(SCALED_IMU_DATA {
+            time_boot_ms: 0,
+            ..Default::default()
+        });
+        assert_eq!(imu_sensor_us(&z), None);
     }
 }
