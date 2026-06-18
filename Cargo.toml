@@ -12,6 +12,12 @@ edition = "2021"
 rust-version = "1.88"
 description = "GPS/IMU drift cross-correlator: detects coordinate spoofing by comparing GPS-reported position against IMU-dead-reckoned position."
 license = "MIT OR Apache-2.0"
+authors = ["Ray Rose"]
+repository = "https://github.com/Ray-Rose/flyingsquirrel"
+homepage = "https://github.com/Ray-Rose/flyingsquirrel"
+readme = "README.md"
+keywords = ["gps", "spoofing", "drone", "mavlink", "security"]
+categories = ["aerospace", "embedded"]
 
 [lib]
 name = "flyingsquirrel"

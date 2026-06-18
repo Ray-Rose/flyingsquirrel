@@ -28,5 +28,7 @@ __pycache__/
 *.swp
 *~
 .DS_Store
+Thumbs.db
+Desktop.ini
 .idea/
 .vscode/

@@ -100,5 +100,4 @@ EXPOSE 14551/udp
 LABEL org.opencontainers.image.title="flyingsquirrel"
 LABEL org.opencontainers.image.description="GPS/IMU anti-spoofing detector for drones"
 LABEL org.opencontainers.image.licenses="MIT OR Apache-2.0"
-# Set image.source to the real repo slug once the GitHub repo exists, e.g.
-# LABEL org.opencontainers.image.source="https://github.com/<owner>/flyingsquirrel"
+LABEL org.opencontainers.image.source="https://github.com/Ray-Rose/flyingsquirrel"

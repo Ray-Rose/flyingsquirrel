@@ -22,11 +22,12 @@ vehicle = "ardu-copter"
 imu_rate = 10.0
 
 [boot_anchor]
-# REQUIRED for production MAV deployment. Operator's launch site coords.
-# This must be within `max_home_distance_m` of the first GPS fix or the
-# detector emits `BootAnchorRejected` and refuses to anchor — defeats
-# meaconing-at-boot.
-expected_home = "40.7128,-74.0060"
+# This is ArduPilot's default SITL home (CMAC, Canberra), so the example runs
+# against SITL out of the box. For ANY real deployment you MUST change this to
+# your actual launch-site coordinates: the first GPS fix must land within
+# `max_home_distance_m` of this point or the detector emits `BootAnchorRejected`
+# and refuses to anchor — that is the meaconing-at-boot defense.
+expected_home = "-35.363261,149.165230"
 max_home_distance_m = 5000.0
 
 [process]
