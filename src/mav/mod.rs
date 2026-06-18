@@ -663,13 +663,28 @@ impl ClockAligner {
                     self.anchor = Some((arrival, s));
                     return arrival;
                 }
-                let aligned = anchor_arrival + std::time::Duration::from_micros(s - anchor_sensor);
-                // Aligned must stay within CLOCK_ALIGN_MAX_SKEW of arrival; past
-                // that the sensor clock isn't tracking wall time, so re-anchor.
-                let skew = aligned
-                    .saturating_duration_since(arrival)
-                    .max(arrival.saturating_duration_since(aligned));
-                if skew > CLOCK_ALIGN_MAX_SKEW {
+                let sensor_delta = std::time::Duration::from_micros(s - anchor_sensor);
+                // Bound the delta BEFORE the `Instant + Duration` add. `s` is an
+                // attacker-controlled wire timestamp (GPS_RAW_INT.time_usec /
+                // SCALED_IMU.time_boot_ms); a crafted huge value would make
+                // `from_micros(s - anchor_sensor)` span centuries and overflow the
+                // monotonic `Instant`, which PANICS (tokio's `Instant: Add`
+                // delegates to std's panicking add) — a one-packet remote kill of
+                // the listener task, i.e. of the whole detector. The aligned stamp
+                // can legitimately sit at most `CLOCK_ALIGN_MAX_SKEW` ahead of
+                // arrival (= anchor_arrival + real elapsed), so any larger delta is
+                // a non-wall-time / garbage clock: re-anchor and use arrival. This
+                // check runs before the arithmetic, so the add can never overflow.
+                let real_elapsed = arrival.saturating_duration_since(anchor_arrival);
+                if sensor_delta > real_elapsed + CLOCK_ALIGN_MAX_SKEW {
+                    self.anchor = Some((arrival, s));
+                    return arrival;
+                }
+                let aligned = anchor_arrival + sensor_delta;
+                // The aligned-BEHIND-arrival direction (sensor ran slower than wall
+                // clock / large latency) is still possible within the bound above;
+                // re-anchor if it drifts more than the skew bound back, too.
+                if arrival.saturating_duration_since(aligned) > CLOCK_ALIGN_MAX_SKEW {
                     self.anchor = Some((arrival, s));
                     return arrival;
                 }
@@ -1153,6 +1168,29 @@ mod clock_align_tests {
                                       // time (base mismatch / garbage), so distrust it and use arrival.
         let arrival = t0 + Duration::from_millis(100);
         assert_eq!(a.align(Some(11_000_000), arrival), arrival);
+    }
+
+    #[test]
+    fn aligner_huge_sensor_timestamp_does_not_panic() {
+        // Regression (one-packet DoS): `s` is an attacker-controlled wire
+        // timestamp (GPS_RAW_INT.time_usec / SCALED_IMU.time_boot_ms). A crafted
+        // huge value after a small anchor used to make `anchor_arrival +
+        // Duration::from_micros(s - anchor_sensor)` overflow the monotonic Instant
+        // and PANIC — killing the listener task and blinding the detector. It must
+        // instead re-anchor and fall back to arrival time.
+        let mut a = ClockAligner::default();
+        let t0 = Instant::now();
+        a.align(Some(1_000), t0); // anchor at a tiny sensor value
+        let arrival = t0 + Duration::from_millis(50);
+        // u64::MAX µs ≈ 584,000 years past the anchor: must NOT panic, use arrival.
+        assert_eq!(a.align(Some(u64::MAX), arrival), arrival);
+        // The fix must not break normal alignment: a +1 s sensor delta arriving
+        // +1 s later (within skew) still tracks the sensor, not arrival jitter.
+        let mut b = ClockAligner::default();
+        let s0 = Instant::now();
+        b.align(Some(10_000_000), s0); // anchor
+        let aligned = b.align(Some(11_000_000), s0 + Duration::from_millis(1000));
+        assert_eq!(aligned, s0 + Duration::from_millis(1000));
     }
 
     #[test]

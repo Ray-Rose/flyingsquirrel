@@ -645,6 +645,31 @@ async fn run() -> Result<(), FsError> {
                     tracing::error!(result = ?r, "action task exited unexpectedly");
                     "task_died:action"
                 }
+                // The MAVLink listener (sole writer of MavMonitor) and the
+                // heartbeat watchdog are PRODUCERS that run until shutdown — they
+                // never exit normally (their rx channels are kept alive). Polling
+                // their handles here means a panic in either is OBSERVED and exits
+                // non-zero for systemd restart, instead of silently leaving the
+                // detector deaf on its command/verify link (e.g. `--controller mav`
+                // with a serial/i2c source, where no source task watches them).
+                r = async {
+                    match mav_listener_join.as_mut() {
+                        Some(h) => h.await,
+                        None => std::future::pending::<Result<(), tokio::task::JoinError>>().await,
+                    }
+                } => {
+                    tracing::error!(result = ?r, "MAVLink listener task exited unexpectedly");
+                    "task_died:mav_listener"
+                }
+                r = async {
+                    match watchdog_handle.as_mut() {
+                        Some(h) => h.await,
+                        None => std::future::pending::<Result<(), tokio::task::JoinError>>().await,
+                    }
+                } => {
+                    tracing::error!(result = ?r, "heartbeat watchdog task exited unexpectedly");
+                    "task_died:watchdog"
+                }
             }
         }
         #[cfg(not(unix))]
@@ -676,6 +701,25 @@ async fn run() -> Result<(), FsError> {
                 r = &mut handles.action => {
                     tracing::error!(result = ?r, "action task exited unexpectedly");
                     "task_died:action"
+                }
+                // See the unix block above — observe listener / watchdog deaths.
+                r = async {
+                    match mav_listener_join.as_mut() {
+                        Some(h) => h.await,
+                        None => std::future::pending::<Result<(), tokio::task::JoinError>>().await,
+                    }
+                } => {
+                    tracing::error!(result = ?r, "MAVLink listener task exited unexpectedly");
+                    "task_died:mav_listener"
+                }
+                r = async {
+                    match watchdog_handle.as_mut() {
+                        Some(h) => h.await,
+                        None => std::future::pending::<Result<(), tokio::task::JoinError>>().await,
+                    }
+                } => {
+                    tracing::error!(result = ?r, "heartbeat watchdog task exited unexpectedly");
+                    "task_died:watchdog"
                 }
             }
         }
@@ -724,13 +768,21 @@ async fn run() -> Result<(), FsError> {
     }
     // Stop the remaining event PRODUCERS (heartbeat watchdog, MAV listener),
     // awaiting their teardown so their broadcast-sender clones are dropped.
+    // is_finished() guard: if the supervisor select already polled one of these
+    // to completion (task_died:mav_listener / task_died:watchdog), re-awaiting the
+    // same handle panics ("JoinHandle polled after completion") — the same hazard
+    // the fusion path guards above. Only abort + await a still-running producer.
     if let Some(h) = mav_listener_join.take() {
-        h.abort();
-        let _ = h.await;
+        if !h.is_finished() {
+            h.abort();
+            let _ = h.await;
+        }
     }
     if let Some(h) = watchdog_handle.take() {
-        h.abort();
-        let _ = h.await;
+        if !h.is_finished() {
+            h.abort();
+            let _ = h.await;
+        }
     }
     // With fusion (awaited above), the drained background tasks, and the
     // producers all gone, drop main's own sender clone: the broadcast channel
