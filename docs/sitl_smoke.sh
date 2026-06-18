@@ -117,9 +117,12 @@ FS_PID=$!
 
 # Inject the spoof via SITL params after FlyingSquirrel preflight passes
 sleep 20
-echo "       Injecting 200m east spoof via SIM_GPS_GLITCH_Y..."
+# NOTE: SIM_GPS_GLITCH_* is in DEGREES, not metres (verified against ArduPilot
+# SIM_GPS.cpp). _Y is longitude (east). At this home latitude (-35.36),
+# 0.0044 deg ~= 400 m east — well above the per-axis CUSUM noise floor.
+echo "       Injecting ~400m east spoof via SIM_GPS_GLITCH_Y (degrees, not metres)..."
 mavproxy.py --master=udpin:127.0.0.1:14550 --cmd "
-param set SIM_GPS_GLITCH_Y 200
+param set SIM_GPS_GLITCH_Y 0.0044
 " --quadcopter --daemon &
 
 # Wait for FlyingSquirrel to finish

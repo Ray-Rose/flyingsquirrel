@@ -1,6 +1,11 @@
 # Validating FlyingSquirrel against ArduPilot SITL
 
-> ## ✅ VALIDATED — full closed loop, continuously re-checked in CI
+> ## ✅ VALIDATED IN SITL — full closed loop, continuously re-checked in CI
+>
+> **Scope:** "validated" here means software-in-the-loop against real
+> ArduPilot/PX4 firmware + the unit/integration/property test suite. It is NOT
+> real-flight-hardware validation — bench / HIL / tethered-flight testing is
+> still required before operational use (see "When SITL passes, what's next").
 >
 > FlyingSquirrel runs end-to-end against **real ArduPilot ArduCopter SITL
 > firmware** in a nightly + on-demand GitHub Actions job

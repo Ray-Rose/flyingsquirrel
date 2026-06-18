@@ -34,16 +34,36 @@ ArduPlane / ArduRover deferred — same protocol surface as ArduCopter
 but different mode IDs; needs per-firmware test coverage before
 shipping.
 
-Real autopilot integration is **validated end-to-end against real
-ArduPilot ArduCopter SITL firmware**: clean flight → injected 400 m GPS
-spoof → detector escalates to `Spoofed` (≈400 m residual) → commands RTL →
-the autopilot switches to RTL. One-command reproduction in
-[`docs/sitl.md`](docs/sitl.md) (`deploy/sitl/run-sitl-validation.{ps1,sh}`).
-This validation surfaced and fixed four real-firmware bugs that the `mavsim`
-self-test could not (ArduPilot streams `SCALED_IMU` not `HIGHRES_IMU`, emits
-MAVLink v1 not v2, runs a ~10 Hz IMU that needs residual-buffer
-extrapolation, and uses `SIM_GPS_GLITCH_Y` in degrees). PX4 SITL validation
-remains the next milestone.
+### Validation status — read this before deploying
+
+FlyingSquirrel is validated in **software-in-the-loop (SITL) simulation against
+real ArduPilot and PX4 firmware**, plus a large unit + integration + property
+test suite. It has **NOT** been validated on real flight hardware — bench /
+hardware-in-the-loop / tethered-flight testing is required before any
+operational use. Treat it as a defense-in-depth research tool, not a certified
+flight-safety component.
+
+What the live-SITL CI proves (nightly + on-demand):
+
+- **ArduPilot ArduCopter** ([`sitl.yml`](.github/workflows/sitl.yml), 3-mode
+  matrix): clean flight → injected GPS spoof → detector escalates to `Spoofed`
+  → severs `GPS_TYPE=0` → commands RTL → autopilot reaches RTL → `ActionAcked`
+  read-back. The matrix covers a wire-level relay spoof, an EKF-fused parameter
+  ramp (proving the sever actually drops the autopilot's GPS lane), and a
+  consistent-velocity "smart" spoof (exercising the velocity-aiding lane).
+- **PX4** ([`sitl-px4.yml`](.github/workflows/sitl-px4.yml)): the closed loop
+  passes — detector reaches Ready, severs `EKF2_GPS_CTRL=0`, PX4 reaches
+  AUTO.RTL. One honest caveat: without a non-GPS position source PX4 LANDs +
+  disarms once GPS is severed, so the *strong* `ActionAcked` read-back is pending
+  an external-vision fallback (an experimental non-gating CI leg); the detector
+  is correct to report `ActionUnconfirmed` on a disarming autopilot.
+
+Testing against real firmware (not just our circular `mavsim` self-test)
+surfaced and fixed four bugs `mavsim` could not: ArduPilot streams `SCALED_IMU`
+not `HIGHRES_IMU`, emits MAVLink v1 not v2, runs a ~10 Hz IMU that needs
+residual-buffer extrapolation, and a PX4 `custom_mode` byte-order bug. One-command
+reproduction + the full findings log are in [`docs/sitl.md`](docs/sitl.md)
+(`deploy/sitl/run-sitl-validation.{ps1,sh}`).
 
 ## Quick start (no hardware)
 
@@ -375,7 +395,7 @@ another peer on the same IP is contending for the already-formed lock.
 ## Testing
 
 ```bash
-cargo test                                 # 100 lib + 14 integration scenarios
+cargo test                                 # ~150 lib + 14 integration scenarios + property tests
 cargo test --all-features                  # also compiles/tests the Linux-only I2C + journald paths
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all --check
@@ -449,4 +469,15 @@ residual-risk list is in [`docs/threats.md`](docs/threats.md).
 
 ## License
 
-(TBD — placeholder for operator to add.)
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or
+  <http://opensource.org/licenses/MIT>)
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.
