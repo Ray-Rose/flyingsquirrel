@@ -95,6 +95,11 @@ fi
 
 echo "[px4] launching harness at $HARNESS_IP (binds udpin:14540, flies PX4, spoofs, watches)"
 set +e
+# Tee the harness stdout into the artifact dir as well. It carries the PX4-SIDE
+# truth — EV-fallback status, the periodic EKF_STATUS_REPORT summary (whether the
+# vision position was actually fused vs. const-pos after the sever), and arm/
+# disarm — which the flaky GitHub Actions log API frequently refuses to return.
+# PIPESTATUS[0] keeps HARNESS_RC as the harness's exit code, not tee's.
 docker run --rm --name fs-harness --network "$NET" --ip "$HARNESS_IP" \
     "$HARNESS_IMAGE" \
     --sitl udpin:0.0.0.0:14540 \
@@ -102,8 +107,8 @@ docker run --rm --name fs-harness --network "$NET" --ip "$HARNESS_IP" \
     --vehicle px4 \
     --glitch-m "$GLITCH_M" --home-lat "$HOME_LAT" \
     --spoof-mode "$SPOOF_MODE" --glitch-ramp-secs "$GLITCH_RAMP_SECS" \
-    --clean-secs "$CLEAN_SECS" --watch-secs "$WATCH_SECS" $EV_ARG
-HARNESS_RC=$?
+    --clean-secs "$CLEAN_SECS" --watch-secs "$WATCH_SECS" $EV_ARG 2>&1 | tee "$OUT_DIR/harness.log"
+HARNESS_RC=${PIPESTATUS[0]}
 set -e
 
 echo ""
@@ -111,6 +116,12 @@ echo ""
 # API has been flaky for these runs, so the downloadable detector.log is the
 # reliable place to read the gate-by-gate "MAV VERIFY" line from.
 docker logs fs-detector > "$OUT_DIR/detector.log" 2>&1 || true
+# Capture PX4's OWN console too. It states the EKF vision-fusion state and the
+# exact reason an EV-fallback run did or didn't hold an armed RTL — "EKF commander:
+# ... GPS fusion", "Landing detected", "Disarmed", or a GPS-loss failsafe. This is
+# what distinguishes "EV never fused -> failsafe land" from "EV fused, RTL flew home
+# and landed" (opposite fixes), so it must be in the artifact, not the flaky job log.
+docker logs fs-px4 > "$OUT_DIR/px4.log" 2>&1 || true
 echo "==================== detector log (last 70 lines) ===================="
 tail -70 "$OUT_DIR/detector.log"
 
