@@ -15,7 +15,11 @@
 # (transitive via ratatui) require rustc 1.88; clap_lex 1.1 requires the
 # edition2024 feature (1.85). 1.88 is the binding constraint. Keep this in
 # sync with Cargo.toml `rust-version` and the CI `msrv` job.
-FROM rust:1.88-slim-bookworm AS builder
+# Digest-pinned for a reproducible, supply-chain-hardened build. The tag is kept
+# for humans; Docker resolves by digest. Dependabot (.github/dependabot.yml,
+# docker ecosystem) opens a PR when the base image updates, so the pin stays
+# current instead of freezing security patches.
+FROM rust:1.88-slim-bookworm@sha256:38bc5a86d998772d4aec2348656ed21438d20fcdce2795b56ca434cf21430d89 AS builder
 
 # Build deps:
 #   pkg-config / libudev-dev   — hw-i2c via linux-embedded-hal
@@ -59,7 +63,8 @@ COPY examples/ ./examples/
 RUN cargo build --release --features hw-i2c,journald --bin flyingsquirrel --bin mavsim
 
 # -------- runtime --------
-FROM debian:bookworm-slim AS runtime
+# Digest-pinned (see the builder stage note). Dependabot keeps it fresh.
+FROM debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df AS runtime
 
 # Runtime deps: libudev (hw-i2c via linux-embedded-hal), libsystemd
 # (tracing-journald). ca-certificates for any HTTPS callers (future).

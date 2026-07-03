@@ -1,0 +1,35 @@
+# Keeps the SHA-pinned GitHub Actions, the Docker base-image digests, and the
+# Cargo dependency tree from going stale. SHA/digest pinning is a supply-chain
+# hardening (an attacker can't repoint a tag to malicious code), but WITHOUT an
+# updater it would freeze security patches. With Dependabot, every pinned action,
+# base image, and crate gets an update PR — reproducible AND current.
+#
+# Cargo security updates here are what would have surfaced the RUSTSEC advisories
+# that the per-push `cargo audit` gate later caught (anyhow/quick-xml, mid-2026)
+# — automatically, and earlier.
+version: 2
+updates:
+  # GitHub Actions — all four workflows pin actions by commit SHA.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      # One grouped PR for routine action bumps instead of one per action.
+      actions:
+        patterns: ["*"]
+
+  # Rust crates. Bumps are PROPOSED only; the MSRV (1.88) + clippy + full test
+  # gates in ci.yml still have to pass before anything merges, so a bump that
+  # breaks the pinned/MSRV-sensitive tree is caught, not shipped.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  # Docker base images in the shipped detector image (deploy/Dockerfile).
+  - package-ecosystem: docker
+    directory: "/deploy"
+    schedule:
+      interval: weekly
