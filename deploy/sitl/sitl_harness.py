@@ -161,6 +161,10 @@ class Relay:
         self.ev_active = False
         self.ev_origin = None  # (lat0, lon0) captured when EV is enabled
         self._last_ev_send = 0.0
+        # GCS heartbeat — PX4 won't arm ("No connection to the GCS") without a
+        # ground-station link. Enabled only on the PX4 path (ArduPilot unaffected).
+        self.gcs_hb_active = False
+        self._last_gcs_hb = 0.0
 
     def _current_spoof_offset(self):
         """(dlat_deg, dlon_deg, dvel_e_mps) for this instant. The step relay
@@ -288,6 +292,13 @@ class Relay:
                 if now - self._last_ev_send >= 1.0 / 30.0:
                     self._last_ev_send = now
                     self._send_ev()
+            # 4) GCS heartbeat @ ~1 Hz — satisfies PX4's "connection to the GCS"
+            #    arming/datalink check (nothing else here is a GCS).
+            if self.gcs_hb_active:
+                nowh = time.time()
+                if nowh - self._last_gcs_hb >= 1.0:
+                    self._last_gcs_hb = nowh
+                    self._send_gcs_heartbeat()
             time.sleep(0.002)
 
     def _send_ev(self):
@@ -326,6 +337,21 @@ class Relay:
             except Exception:
                 continue
 
+    def _send_gcs_heartbeat(self):
+        """One MAV_TYPE_GCS heartbeat so PX4's datalink/GCS arming check passes.
+        Sent from a GCS sysid (255), distinct from the autopilot and the vision
+        source; srcSystem is reset per-message by the relay/EV packers, same as
+        _send_ev. Swallow-all so a transient send error can't kill the pump."""
+        self.sitl.mav.srcSystem = 255
+        self.sitl.mav.srcComponent = mavutil.mavlink.MAV_COMP_ID_MISSIONPLANNER
+        try:
+            self.sitl.mav.heartbeat_send(
+                mavutil.mavlink.MAV_TYPE_GCS,
+                mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+                0, 0, mavutil.mavlink.MAV_STATE_ACTIVE)
+        except Exception:
+            pass
+
     # --- choreography helpers (run on main thread) ---
     def wait_gps(self, timeout=180):
         # Observe the relay thread's shared GPS state — do NOT call recv_match
@@ -360,11 +386,17 @@ class Relay:
             "before the detector's read-back dwell completes".format(self.rel_alt_m))
         return False
 
-    def set_param(self, name, value):
+    def set_param(self, name, value, param_type=None):
+        if param_type is None:
+            param_type = mavutil.mavlink.MAV_PARAM_TYPE_REAL32
         self.sitl.mav.param_set_send(
             self.sitl.target_system, self.sitl.target_component,
-            name.encode("ascii"), float(value),
-            mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
+            name.encode("ascii"), float(value), param_type)
+
+    def set_param_int(self, name, value):
+        """Set an INT32 param. PX4 rejects an int param sent as REAL32 with a
+        'param types mismatch' (observed live on EKF2_EV_NOISE_MD)."""
+        self.set_param(name, value, mavutil.mavlink.MAV_PARAM_TYPE_INT32)
 
     def enable_ev_fallback(self):
         """Capture the current true position as the EV origin and begin streaming
@@ -488,17 +520,25 @@ def main():
     # against the relay) — we send raw commands, pace with sleeps, and observe
     # arm/mode/alt via the relay state. The sequence is vehicle-specific.
     if is_px4:
-        # PX4 has no ARMING_CHECK param. Relax RC-loss arming (COM_RCL_EXCEPT bit
-        # 2 = 4) and set the takeoff altitude, force-arm (PX4 also honors the
-        # 21196 magic), then command NAV_TAKEOFF — PX4 auto-engages AUTO.TAKEOFF
-        # (main=4/sub=2). SITL-only relaxations, never a real vehicle.
-        log("PX4: COM_RCL_EXCEPT=4 + takeoff alt {} m".format(args.takeoff_alt))
+        # PX4 refuses to arm ("Preflight Fail: No connection to the GCS") until it
+        # sees a ground-station link, and it has no ARMING_CHECK bypass param. So:
+        #   (1) stream a MAV_TYPE_GCS heartbeat (see _send_gcs_heartbeat),
+        #   (2) disable the data-link-loss failsafe (NAV_DLL_ACT=0) so the check is
+        #       skipped AND a heartbeat hiccup can't disarm us mid-flight,
+        #   (3) relax RC-loss arming (COM_RCL_EXCEPT bit2=4).
+        # Then force-arm (PX4 honors the 21196 magic) + NAV_TAKEOFF -> AUTO.TAKEOFF
+        # (main=4/sub=2). All SITL-only relaxations, never a real vehicle. INT32
+        # params are typed INT32 (PX4 rejects an int param sent as REAL32).
+        r.gcs_hb_active = True
+        log("PX4: GCS heartbeat ON + NAV_DLL_ACT=0 + COM_RCL_EXCEPT=4 + takeoff alt {} m".format(
+            args.takeoff_alt))
         for _ in range(3):
-            r.set_param("COM_RCL_EXCEPT", 4)
+            r.set_param_int("NAV_DLL_ACT", 0)
+            r.set_param_int("COM_RCL_EXCEPT", 4)
             r.set_param("COM_TKO_ALT", float(args.takeoff_alt))
             r.set_param("MIS_TAKEOFF_ALT", float(args.takeoff_alt))
             time.sleep(0.5)
-        time.sleep(5)  # let params apply / EKF settle
+        time.sleep(5)  # let params apply / EKF settle / GCS link register
         log("PX4 force-arming (COMPONENT_ARM_DISARM param1=1 param2=21196)")
         arm_deadline = time.time() + 30
         while time.time() < arm_deadline and not r.is_armed():
@@ -566,10 +606,10 @@ def main():
         # (same dual-name tactic the param-mode SIM_GPS ramp uses).
         log("PX4 EV fallback: EKF2_EV_CTRL=11 + EKF2_AID_MASK|=8 (fuse external vision)")
         for _ in range(3):
-            r.set_param("EKF2_EV_CTRL", 11)
-            r.set_param("EKF2_AID_MASK", 9)  # 1 (GPS) | 8 (EV position)
-            r.set_param("EKF2_EV_NOISE_MD", 0)  # use the param noise below, not msg cov
-            r.set_param("EKF2_EVP_NOISE", 0.1)  # 0.1 m EV position noise (high confidence)
+            r.set_param_int("EKF2_EV_CTRL", 11)
+            r.set_param_int("EKF2_AID_MASK", 9)  # 1 (GPS) | 8 (EV position)
+            r.set_param_int("EKF2_EV_NOISE_MD", 0)  # param noise below, not msg cov [INT32]
+            r.set_param("EKF2_EVP_NOISE", 0.1)  # 0.1 m EV position noise [REAL32]
             time.sleep(0.5)
         if r.enable_ev_fallback():
             # Let the EKF fuse EV alongside GPS for a few seconds before the
