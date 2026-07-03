@@ -537,6 +537,11 @@ def main():
             r.set_param_int("COM_RCL_EXCEPT", 4)
             r.set_param("COM_TKO_ALT", float(args.takeoff_alt))
             r.set_param("MIS_TAKEOFF_ALT", float(args.takeoff_alt))
+            # Don't let PX4 auto-disarm the grounded vehicle before it climbs
+            # (COM_DISARM_PRFLT) or the instant an RTL touches down mid-dwell
+            # (COM_DISARM_LAND). 0 disables each. Both are seconds (REAL32).
+            r.set_param("COM_DISARM_PRFLT", 0)
+            r.set_param("COM_DISARM_LAND", 0)
             time.sleep(0.5)
         time.sleep(5)  # let params apply / EKF settle / GCS link register
         log("PX4 force-arming (COMPONENT_ARM_DISARM param1=1 param2=21196)")
@@ -546,9 +551,17 @@ def main():
                 sysid, compid, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
                 0, 1, 21196, 0, 0, 0, 0, 0)
             time.sleep(1.5)
-        log("PX4 armed={} ; NAV_TAKEOFF to {} m (AUTO.TAKEOFF)".format(
+        log("PX4 armed={} ; AUTO.TAKEOFF mode + NAV_TAKEOFF to {} m (rel via COM_TKO_ALT)".format(
             r.is_armed(), args.takeoff_alt))
-        for _ in range(3):
+        for _ in range(4):
+            # Command AUTO.TAKEOFF mode explicitly (main=4/sub=2): PX4 climbs to
+            # COM_TKO_ALT, which is RELATIVE — sidestepping NAV_TAKEOFF's param7
+            # AMSL-vs-relative ambiguity (30 read as AMSL is far below Zurich's
+            # ~488 m ground, so the vehicle never climbed, then auto-disarmed).
+            r.sitl.mav.command_long_send(
+                sysid, compid, mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0,
+                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 4, 2, 0, 0, 0, 0)
+            # NAV_TAKEOFF as well (belt-and-suspenders).
             r.sitl.mav.command_long_send(
                 sysid, compid, mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
                 0, 0, 0, 0, 0, 0, 0, args.takeoff_alt)
