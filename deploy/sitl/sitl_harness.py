@@ -542,6 +542,10 @@ def main():
             # (COM_DISARM_LAND). 0 disables each. Both are seconds (REAL32).
             r.set_param("COM_DISARM_PRFLT", 0)
             r.set_param("COM_DISARM_LAND", 0)
+            # The gazebo SITL battery drains to CRITICAL within a few minutes and
+            # its low-battery failsafe force-lands mid-climb ("blind land"). Set
+            # the action to Warning-only (0) so it can't abort the flight. INT32.
+            r.set_param_int("COM_LOW_BAT_ACT", 0)
             time.sleep(0.5)
         time.sleep(5)  # let params apply / EKF settle / GCS link register
         log("PX4 force-arming (COMPONENT_ARM_DISARM param1=1 param2=21196)")
@@ -614,13 +618,12 @@ def main():
         # EKF2_EV_CTRL is the modern (>=1.13) external-vision bitmask:
         #   bit0(1)=horizontal position, bit1(2)=vertical position,
         #   bit2(4)=velocity, bit3(8)=yaw. 11 = horiz+vert pos + yaw.
-        # EKF2_AID_MASK is the pre-1.13 equivalent (bit3=8 -> vision position);
-        # set both, the param that doesn't exist on this firmware is ignored
-        # (same dual-name tactic the param-mode SIM_GPS ramp uses).
-        log("PX4 EV fallback: EKF2_EV_CTRL=11 + EKF2_AID_MASK|=8 (fuse external vision)")
+        # (The pre-1.13 EKF2_AID_MASK is intentionally NOT set — live SITL logged
+        # "unknown param: EKF2_AID_MASK", i.e. this firmware is >=1.13, matching
+        # the EKF2_GPS_CTRL sever path. Setting it only spammed mavlink errors.)
+        log("PX4 EV fallback: EKF2_EV_CTRL=11 (fuse external vision)")
         for _ in range(3):
             r.set_param_int("EKF2_EV_CTRL", 11)
-            r.set_param_int("EKF2_AID_MASK", 9)  # 1 (GPS) | 8 (EV position)
             r.set_param_int("EKF2_EV_NOISE_MD", 0)  # param noise below, not msg cov [INT32]
             r.set_param("EKF2_EVP_NOISE", 0.1)  # 0.1 m EV position noise [REAL32]
             time.sleep(0.5)
