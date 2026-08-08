@@ -165,6 +165,21 @@ class Relay:
         # ground-station link. Enabled only on the PX4 path (ArduPilot unaffected).
         self.gcs_hb_active = False
         self._last_gcs_hb = 0.0
+        # EKF-validity evidence for the pre-arm gate (PX4). PX4 publishes
+        # LOCAL_POSITION_NED / GLOBAL_POSITION_INT only from the EKF output, and
+        # broadcasts HOME_POSITION once the EKF's global position first becomes
+        # valid; ESTIMATOR_STATUS carries the estimator's own health flags (the
+        # PX4 counterpart of ArduPilot's EKF_STATUS_REPORT, which PX4 never
+        # sends — waiting on EKF_STATUS_REPORT from PX4 waits forever).
+        self.est_flags = None  # ESTIMATOR_STATUS.flags
+        self.home_seen = False
+        self.first_local_t = None  # LOCAL_POSITION_NED first/last arrival
+        self.last_local_t = None
+        self.first_gpos_t = None  # GLOBAL_POSITION_INT first/last arrival
+        self.last_gpos_t = None
+        # Latest COMMAND_ACK result per command id — lets the choreography see
+        # WHY an arm was rejected instead of blindly retrying.
+        self.cmd_acks = {}
 
     def _current_spoof_offset(self):
         """(dlat_deg, dlon_deg, dvel_e_mps) for this instant. The step relay
@@ -258,6 +273,29 @@ class Relay:
                     # its real position, not the spoofed one.
                     self.true_lat = msg.lat / 1e7
                     self.true_lon = msg.lon / 1e7
+                    now_g = time.time()
+                    if self.first_gpos_t is None:
+                        self.first_gpos_t = now_g
+                    self.last_gpos_t = now_g
+                elif mt == "LOCAL_POSITION_NED":
+                    now_l = time.time()
+                    if self.first_local_t is None:
+                        self.first_local_t = now_l
+                    self.last_local_t = now_l
+                elif mt == "ESTIMATOR_STATUS":
+                    self.est_flags = msg.flags
+                elif mt == "HOME_POSITION":
+                    self.home_seen = True
+                elif mt == "COMMAND_ACK":
+                    self.cmd_acks[msg.command] = msg.result
+                elif mt == "STATUSTEXT":
+                    # Surface the autopilot's own words (arm denials, failsafe
+                    # reasons, EKF resets) straight into harness.log — the
+                    # artifact-side truth without grepping a giant px4.log.
+                    try:
+                        log("[autopilot sev={}] {}".format(msg.severity, msg.text))
+                    except Exception:
+                        pass
                 elif mt == "EKF_STATUS_REPORT":
                     self.ekf_flags = msg.flags
                     self.ekf_vel_var = msg.velocity_variance
@@ -413,21 +451,71 @@ class Relay:
         return True
 
     def ekf_summary(self):
-        """Human-readable EKF_STATUS_REPORT snapshot. Flag bits are the stable
-        MAVLink EKF_STATUS_FLAGS enum: POS_HORIZ_ABS=16 (absolute horizontal
-        position — GPS-aided), CONST_POS_MODE=128 (no position aiding, set when
-        GPS is dropped), GPS_GLITCHING=32768 (innovation gate tripped — a jump
-        the EKF REJECTED rather than fused). For a fused gradual ramp expect
-        pos_horiz_abs=True + gps_glitching=False; after the sever expect
-        pos_horiz_abs to clear / const_pos_mode to set."""
+        """Human-readable estimator snapshot. ArduPilot streams EKF_STATUS_REPORT;
+        PX4 streams ESTIMATOR_STATUS instead (it NEVER sends EKF_STATUS_REPORT —
+        the old code waited on it forever). Both enums share the low bits:
+        POS_HORIZ_ABS=16 (absolute horizontal position), CONST_POS_MODE=128 (no
+        position aiding, set when GPS is dropped). ArduPilot GPS_GLITCHING=32768;
+        PX4 GPS_GLITCH=1024. For a fused gradual ramp expect pos_horiz_abs=True +
+        glitching=False; after the sever expect pos_horiz_abs to clear (or, with
+        the EV fallback fused, HOLD) / const_pos_mode to set."""
+        if self.est_flags is not None:
+            f = self.est_flags
+            return (
+                "EST flags=0x{:04x} pos_horiz_abs={} pos_vert_abs={} "
+                "const_pos_mode={} gps_glitch={}".format(
+                    f, bool(f & 16), bool(f & 32), bool(f & 128), bool(f & 1024)))
         if self.ekf_flags is None:
-            return "EKF_STATUS not yet seen"
+            return "EKF/ESTIMATOR_STATUS not yet seen"
         f = self.ekf_flags
         return (
             "EKF flags=0x{:04x} pos_horiz_abs={} const_pos_mode={} gps_glitching={} "
             "| vel_var={:.2f} pos_horiz_var={:.2f}".format(
                 f, bool(f & 16), bool(f & 128), bool(f & 32768),
                 self.ekf_vel_var or 0.0, self.ekf_pos_horiz_var or 0.0))
+
+    def wait_px4_ekf_ready(self, timeout=150, stable_secs=10.0):
+        """Block until PX4's EKF plausibly has a valid absolute position — the
+        health gate the blind-land runs jumped: force-arming past 'ekf2 missing
+        data' let AUTO.TAKEOFF start position control with no valid local
+        position, so mc_pos_control got 'invalid setpoints' and failsafe'd into
+        a blind land seconds after 'Takeoff detected'. Ready means ANY of:
+          * ESTIMATOR_STATUS reports POS_HORIZ_ABS(16) + POS_VERT_ABS(32), or
+          * PX4 broadcast HOME_POSITION (it does so exactly when the EKF global
+            position first becomes valid), or
+          * LOCAL_POSITION_NED AND GLOBAL_POSITION_INT (both EKF outputs) have
+            been streaming steadily for `stable_secs` and are fresh (<3 s old)
+            — the fallback when neither status message is streamed.
+        The timeout is generous: under CI lockstep the sim clock can run well
+        below wall time, stretching EKF convergence in wall-clock terms."""
+        log("PX4: waiting for a valid EKF position before arming...")
+        end = time.time() + timeout
+        last_report = 0.0
+        while time.time() < end:
+            now = time.time()
+            if self.est_flags is not None and (self.est_flags & 16) and (self.est_flags & 32):
+                log("PX4 EKF ready: {}".format(self.ekf_summary()))
+                return True
+            if self.home_seen:
+                log("PX4 EKF ready: HOME_POSITION broadcast (global position valid)")
+                return True
+            if (self.first_local_t is not None and self.first_gpos_t is not None
+                    and now - max(self.first_local_t, self.first_gpos_t) >= stable_secs
+                    and now - self.last_local_t < 3.0 and now - self.last_gpos_t < 3.0):
+                log("PX4 EKF ready: LOCAL_POSITION_NED + GLOBAL_POSITION_INT "
+                    "streaming steadily for {:.0f}s".format(
+                        now - max(self.first_local_t, self.first_gpos_t)))
+                return True
+            if now - last_report >= 10:
+                log("  ...EKF not ready yet ({} | local_pos={} gpos={} home={})".format(
+                    self.ekf_summary(),
+                    self.first_local_t is not None, self.first_gpos_t is not None,
+                    self.home_seen))
+                last_report = now
+            time.sleep(0.5)
+        log("WARN: EKF readiness NOT confirmed within {}s — arming anyway "
+            "(expect a possible blind-land failsafe)".format(timeout))
+        return False
 
 
 def main():
@@ -525,17 +613,20 @@ def main():
         #   (1) stream a MAV_TYPE_GCS heartbeat (see _send_gcs_heartbeat),
         #   (2) disable the data-link-loss failsafe (NAV_DLL_ACT=0) so the check is
         #       skipped AND a heartbeat hiccup can't disarm us mid-flight,
-        #   (3) relax RC-loss arming (COM_RCL_EXCEPT bit2=4).
-        # Then force-arm (PX4 honors the 21196 magic) + NAV_TAKEOFF -> AUTO.TAKEOFF
-        # (main=4/sub=2). All SITL-only relaxations, never a real vehicle. INT32
-        # params are typed INT32 (PX4 rejects an int param sent as REAL32).
+        #   (3) relax RC-loss arming (COM_RCL_EXCEPT bit2=4) and disable stick
+        #       input entirely (COM_RC_IN_MODE=4) — there is no RC in this rig.
+        # All SITL-only relaxations, never a real vehicle. INT32 params are typed
+        # INT32 (PX4 rejects an int param sent as REAL32). COM_TKO_ALT is NOT set:
+        # live SITL logged "unknown param: COM_TKO_ALT" on this firmware — the
+        # AUTO.TAKEOFF climb altitude actually comes from MIS_TAKEOFF_ALT
+        # (navigator logged "Using default takeoff altitude: 30.0 m").
         r.gcs_hb_active = True
         log("PX4: GCS heartbeat ON + NAV_DLL_ACT=0 + COM_RCL_EXCEPT=4 + takeoff alt {} m".format(
             args.takeoff_alt))
         for _ in range(3):
             r.set_param_int("NAV_DLL_ACT", 0)
             r.set_param_int("COM_RCL_EXCEPT", 4)
-            r.set_param("COM_TKO_ALT", float(args.takeoff_alt))
+            r.set_param_int("COM_RC_IN_MODE", 4)
             r.set_param("MIS_TAKEOFF_ALT", float(args.takeoff_alt))
             # Don't let PX4 auto-disarm the grounded vehicle before it climbs
             # (COM_DISARM_PRFLT) or the instant an RTL touches down mid-dwell
@@ -547,21 +638,55 @@ def main():
             # the action to Warning-only (0) so it can't abort the flight. INT32.
             r.set_param_int("COM_LOW_BAT_ACT", 0)
             time.sleep(0.5)
-        time.sleep(5)  # let params apply / EKF settle / GCS link register
-        log("PX4 force-arming (COMPONENT_ARM_DISARM param1=1 param2=21196)")
-        arm_deadline = time.time() + 30
+        # Ask PX4 to stream the EKF-health evidence: ESTIMATOR_STATUS (230) and
+        # HOME_POSITION (242) @1 Hz. PX4 does NOT send ArduPilot's
+        # EKF_STATUS_REPORT, so without this the harness is blind to the
+        # estimator (every prior run logged "EKF_STATUS not yet seen").
+        for mid in (230, 242):
+            for _ in range(3):
+                r.sitl.mav.command_long_send(
+                    sysid, compid, mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                    0, mid, 1e6, 0, 0, 0, 0, 0)
+                time.sleep(0.3)
+        time.sleep(3)  # let params apply / GCS link register
+        # THE core fix for the blind-land failure chain: do NOT force-arm past an
+        # EKF that has no valid position. Wait for genuine EKF validity first —
+        # arming into AUTO.TAKEOFF without a local position made mc_pos_control
+        # emit 'invalid setpoints' and blind-land seconds after liftoff.
+        r.wait_px4_ekf_ready()
+        # Arm NORMALLY first (param2=0) — a normal arm is only ACCEPTED when
+        # PX4's own health checks pass, so acceptance re-verifies EKF readiness.
+        # STATUSTEXT (relayed into this log) says exactly why a denial happened.
+        RESULT_NAMES = {0: "ACCEPTED", 1: "TEMPORARILY_REJECTED", 2: "DENIED",
+                        3: "UNSUPPORTED", 4: "FAILED", 5: "IN_PROGRESS", 6: "CANCELLED"}
+        ARM_CMD = mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM
+        log("PX4 arming (normal COMPONENT_ARM_DISARM, health-checked)")
+        arm_deadline = time.time() + 45
+        last_ack = None
         while time.time() < arm_deadline and not r.is_armed():
             r.sitl.mav.command_long_send(
-                sysid, compid, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-                0, 1, 21196, 0, 0, 0, 0, 0)
+                sysid, compid, ARM_CMD, 0, 1, 0, 0, 0, 0, 0, 0)
             time.sleep(1.5)
-        log("PX4 armed={} ; AUTO.TAKEOFF mode + NAV_TAKEOFF to {} m (rel via COM_TKO_ALT)".format(
-            r.is_armed(), args.takeoff_alt))
+            ack = r.cmd_acks.get(ARM_CMD)
+            if ack is not None and ack != last_ack:
+                log("  arm COMMAND_ACK: {}".format(RESULT_NAMES.get(ack, ack)))
+                last_ack = ack
+        if not r.is_armed():
+            # Backstop only. If health never converges, fall back to the force
+            # magic so the run still produces diagnostics downstream.
+            log("PX4 normal arm not accepted; falling back to force-arm (21196)")
+            arm_deadline = time.time() + 20
+            while time.time() < arm_deadline and not r.is_armed():
+                r.sitl.mav.command_long_send(
+                    sysid, compid, ARM_CMD, 0, 1, 21196, 0, 0, 0, 0, 0)
+                time.sleep(1.5)
+        log("PX4 armed={} ; AUTO.TAKEOFF mode + NAV_TAKEOFF to {} m (rel via "
+            "MIS_TAKEOFF_ALT)".format(r.is_armed(), args.takeoff_alt))
         for _ in range(4):
             # Command AUTO.TAKEOFF mode explicitly (main=4/sub=2): PX4 climbs to
-            # COM_TKO_ALT, which is RELATIVE — sidestepping NAV_TAKEOFF's param7
-            # AMSL-vs-relative ambiguity (30 read as AMSL is far below Zurich's
-            # ~488 m ground, so the vehicle never climbed, then auto-disarmed).
+            # MIS_TAKEOFF_ALT, which is RELATIVE — sidestepping NAV_TAKEOFF's
+            # param7 AMSL-vs-relative ambiguity (30 read as AMSL is far below
+            # Zurich's ~488 m ground, so the vehicle never climbed).
             r.sitl.mav.command_long_send(
                 sysid, compid, mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0,
                 mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 4, 2, 0, 0, 0, 0)
@@ -606,7 +731,9 @@ def main():
     # Confirm airborne so a later RTL keeps the vehicle armed through the
     # detector's read-back dwell (descending from altitude takes >> the 5 s
     # verify window, so it stays armed long enough to confirm ActionAcked).
-    r.wait_airborne(args.takeoff_alt * 0.5)
+    # PX4 gets a longer window: under CI lockstep the sim clock runs below wall
+    # time, stretching the climb in wall-clock terms.
+    r.wait_airborne(args.takeoff_alt * 0.5, timeout=90 if is_px4 else 40)
 
     # PX4 ActionAcked fallback: give PX4 a non-GPS position source so it can hold
     # an armed RTL after the detector severs GPS (otherwise PX4 loses position ->

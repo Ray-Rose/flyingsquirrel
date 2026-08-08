@@ -28,7 +28,11 @@ CLEAN_SECS="${CLEAN_SECS:-25}"
 WATCH_SECS="${WATCH_SECS:-70}"
 SPOOF_MODE="${SPOOF_MODE:-relay}"
 GLITCH_RAMP_SECS="${GLITCH_RAMP_SECS:-60}"
-DETECTOR_DURATION="${DETECTOR_DURATION:-320}"
+# Must outlast the WHOLE choreography: boot(75) + GPS wait + params + the EKF
+# readiness wait (<=150s) + arm (<=65s) + takeoff (<=90s) + EV settle + clean +
+# watch + verify grace. The detector exiting early (duration elapsed) mid-run
+# looks like a detection failure — keep this comfortably above the worst case.
+DETECTOR_DURATION="${DETECTOR_DURATION:-560}"
 IMU_RATE="${IMU_RATE:-50}"
 # Experimental PX4 ActionAcked path (opt-in). When set, the harness injects an
 # external-vision position so PX4 keeps a non-GPS position estimate after the GPS
@@ -121,7 +125,12 @@ docker logs fs-detector > "$OUT_DIR/detector.log" 2>&1 || true
 # ... GPS fusion", "Landing detected", "Disarmed", or a GPS-loss failsafe. This is
 # what distinguishes "EV never fused -> failsafe land" from "EV fused, RTL flew home
 # and landed" (opposite fixes), so it must be in the artifact, not the flaky job log.
-docker logs fs-px4 > "$OUT_DIR/px4.log" 2>&1 || true
+# SANITIZED: the raw stream is ~800 MB of "pxh> " prompt-redraw + ANSI-erase spam
+# (observed live — it swamped the uploaded artifact); normalize \r to \n, strip
+# ANSI escapes and the pxh> prompts, drop blank lines, and cap as a backstop.
+docker logs fs-px4 2>&1 | tr -d '\000' | tr '\r' '\n' \
+    | sed -e $'s/\x1b\\[[0-9;]*[A-Za-z]//g' -e 's/pxh> //g' -e '/^[[:space:]]*$/d' \
+    | tail -c 50M > "$OUT_DIR/px4.log" || true
 echo "==================== detector log (last 70 lines) ===================="
 tail -70 "$OUT_DIR/detector.log"
 
