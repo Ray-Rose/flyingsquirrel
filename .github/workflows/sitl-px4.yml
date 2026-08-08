@@ -27,7 +27,9 @@ jobs:
   px4-smoke:
     name: PX4 SITL bring-up smoke
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # 30 like the other jobs: a slow runner + the heavy Gazebo image pull pushed
+    # one dispatch past 25 (cancelled at the timeout, not a real failure).
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 

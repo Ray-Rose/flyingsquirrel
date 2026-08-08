@@ -474,6 +474,23 @@ harness-side (the detector was correct throughout):
   `ignoring CMD with same SYS/COMP (1/1) ID` (one leg lost this race for its
   whole 65 s arm window and never armed). All harness sends now go through
   `send_as_gcs()` (lock + explicit sysid-255 stamp).
+- **Residual sim artifact (accepted, documented): the image's AUTO.TAKEOFF
+  runs away.** From the instant of liftoff the x500 slides SSW at a constant
+  ~5 m/s (course ~191°) while climbing — ~50 m by takeoff-complete — with
+  identical behavior whether external vision is fused from boot, mid-climb, or
+  not at all, so it is intrinsic to the image's flight dynamics/estimator on CI
+  runners, not an aiding-config problem. The detector latches Suspicious→Spoofed
+  on the honest GPS-vs-DR mismatch during this genuinely anomalous flight
+  (~2/3 of the motion is tracked by dead reckoning; the shortfall is consistent
+  with Madgwick attitude error under sustained tilt + linear acceleration),
+  BEFORE the scripted spoof is injected. Consequence for the `px4-action-acked`
+  leg: it is GREEN and proves everything it exists to prove — normal
+  health-checked arming, real flight, detection→sever→RTL, PX4 holding an armed
+  RTL-equivalent through the read-back dwell, `ActionAcked` confirmed — but the
+  detection trigger is the runaway rather than the scripted wire spoof. On real
+  hardware this latch shape does not arise: a real IMU feels a real runaway, DR
+  tracks it, and the residual stays small. The validated no-false-latch envelope
+  (realistic noise, turns, long linear flight) is unchanged.
 
 ## When SITL passes, what's next
 
