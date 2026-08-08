@@ -28,6 +28,13 @@ CLEAN_SECS="${CLEAN_SECS:-25}"
 WATCH_SECS="${WATCH_SECS:-70}"
 SPOOF_MODE="${SPOOF_MODE:-relay}"
 GLITCH_RAMP_SECS="${GLITCH_RAMP_SECS:-60}"
+# Receiver-noise model on the detector-bound GPS (metres, 1-sigma/axis). The gz
+# navsat GPS is NOISELESS — bit-identical fixes during the takeoff climb are
+# indistinguishable from a frozen/replay attack, so the detector (correctly)
+# latched FrozenGps mid-climb and RTL'd before the scripted spoof (live
+# 2026-08-08). 1.0 m models a real receiver; ArduPilot SITL needs none (its sim
+# GPS already jitters, which is why its legs never hit this).
+GPS_JITTER_M="${GPS_JITTER_M:-1.0}"
 # Must outlast the WHOLE choreography: boot(75) + GPS wait + params + the EKF
 # readiness wait (<=150s) + arm (<=65s) + takeoff (<=90s) + EV settle + clean +
 # watch + verify grace. The detector exiting early (duration elapsed) mid-run
@@ -111,6 +118,7 @@ docker run --rm --name fs-harness --network "$NET" --ip "$HARNESS_IP" \
     --vehicle px4 \
     --glitch-m "$GLITCH_M" --home-lat "$HOME_LAT" \
     --spoof-mode "$SPOOF_MODE" --glitch-ramp-secs "$GLITCH_RAMP_SECS" \
+    --gps-jitter-m "$GPS_JITTER_M" \
     --clean-secs "$CLEAN_SECS" --watch-secs "$WATCH_SECS" $EV_ARG 2>&1 | tee "$OUT_DIR/harness.log"
 HARNESS_RC=${PIPESTATUS[0]}
 set -e

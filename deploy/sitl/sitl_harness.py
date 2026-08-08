@@ -30,6 +30,7 @@ mode (RTL/LAND/SMART_RTL) after the spoof — i.e. the whole chain worked.
 """
 import argparse
 import math
+import random
 import socket
 import sys
 import threading
@@ -46,10 +47,13 @@ ARDU_RTL_EQUIV = {6, 9, 21}  # RTL, LAND, SMART_RTL
 
 # PX4 packs custom_mode as (sub_mode<<24)|(main_mode<<16) — main_mode in bits
 # 16..23, sub_mode in bits 24..31 (the px4_custom_mode union). AUTO main=4; the
-# return/land sub-modes are RTL=5, LAND=6, RTGS=7 — these are PX4's "no longer
-# GPS-navigating" states. VERIFIED against live PX4 SITL: AUTO.RTL = 0x05040000.
+# return/land sub-modes are RTL=5, LAND=6, RTGS=7, DESCEND=20 — PX4's "no longer
+# GPS-navigating" states. DESCEND is the position-LESS emergency descent PX4
+# falls into when it can't navigate an RTL (observed live 2026-08-08 as
+# 0x14040000 after the detector's GPS sever). VERIFIED against live PX4 SITL:
+# AUTO.RTL = 0x05040000. Mirrors the detector's is_rtl_mode.
 PX4_MAIN_AUTO = 4
-PX4_AUTO_RTL_SUBS = {5, 6, 7}
+PX4_AUTO_RTL_SUBS = {5, 6, 7, 20}
 
 
 def is_rtl_equiv(vehicle, custom_mode):
@@ -67,6 +71,17 @@ def is_rtl_equiv(vehicle, custom_mode):
 
 def log(msg):
     print("[harness] {}".format(msg), flush=True)
+
+
+def mode_name(vehicle, custom_mode):
+    """Human-readable mode for the periodic logs. ArduCopter uses the flat
+    MODE_NAMES table; PX4 prints hex (its packed encoding never matches the
+    ArduCopter table, which previously rendered every PX4 mode as '?')."""
+    if custom_mode is None:
+        return "?"
+    if vehicle == "px4":
+        return "0x{:08x}".format(custom_mode)
+    return MODE_NAMES.get(custom_mode, "?")
 
 
 class Relay:
@@ -127,6 +142,17 @@ class Relay:
         self.spoof_active = False
         self.spoof_dlat_deg = 0.0
         self.spoof_dlon_deg = 0.0
+        # Receiver-noise model for the DETECTOR-bound GPS_RAW_INT copy only
+        # (PX4's own GPS and GLOBAL_POSITION_INT are untouched). Gazebo's navsat
+        # plugin is NOISELESS: while the vehicle hovers or climbs vertically its
+        # lat/lon repeat BIT-IDENTICALLY fix after fix — which is precisely the
+        # frozen/replay attack signature (detector FROZEN_FIX_RADIUS_M = 0.5 m),
+        # so the detector correctly latched FrozenGps mid-climb and RTL'd before
+        # the scripted spoof (observed live 2026-08-08). A real receiver always
+        # jitters fix-to-fix (~1-2.5 m CEP); adding gaussian noise restores that
+        # physical realism rather than desensitizing the detector. 0 = off
+        # (ArduPilot SITL already models receiver noise).
+        self.gps_jitter_m = 0.0
         # Smart-relay (consistent-velocity) extension. When `spoof_smart`, the
         # position offset RAMPS over `spoof_ramp_secs` instead of stepping, and a
         # MATCHING east velocity bias (`spoof_rate_e_mps`) is written into the
@@ -216,19 +242,32 @@ class Relay:
     def _maybe_spoof_and_serialize(self, msg, mt):
         """Return the bytes to forward for `msg`. When the spoof is armed and
         `msg` carries position (GPS_RAW_INT / GLOBAL_POSITION_INT), rewrite its
-        lat/lon (and, in smart mode, its velocity) and re-encode; otherwise return
-        the original raw bytes unchanged.
+        lat/lon (and, in smart mode, its velocity) and re-encode. Receiver
+        jitter (`gps_jitter_m`) additionally perturbs the RAW-receiver message
+        (GPS_RAW_INT — the message a real receiver's noise lives in) whether or
+        not the spoof is active. Otherwise return the original bytes unchanged.
 
         lat/lon in both messages are int32 in 1e-7 degrees, so the offset is
         `round(deg * 1e7)`."""
-        if not self.spoof_active or mt not in ("GPS_RAW_INT", "GLOBAL_POSITION_INT"):
+        jitter_this = self.gps_jitter_m > 0.0 and mt == "GPS_RAW_INT"
+        spoof_this = self.spoof_active and mt in ("GPS_RAW_INT", "GLOBAL_POSITION_INT")
+        if not (jitter_this or spoof_this):
             return msg.get_msgbuf()
-        dlat_deg, dlon_deg, dvel_e_mps = self._current_spoof_offset()
         try:
-            msg.lat += int(round(dlat_deg * 1e7))
-            msg.lon += int(round(dlon_deg * 1e7))
-            if dvel_e_mps != 0.0:
-                self._rewrite_velocity_east(msg, mt, dvel_e_mps)
+            if jitter_this:
+                # Horizontal-only gaussian noise, sigma = gps_jitter_m per axis.
+                # (m -> deg: 111320 m/deg latitude; scaled by cos(lat) for lon.)
+                lat_now = msg.lat / 1e7
+                coslat = max(math.cos(math.radians(lat_now)), 1e-6)
+                msg.lat += int(round(random.gauss(0.0, self.gps_jitter_m) / 111320.0 * 1e7))
+                msg.lon += int(round(
+                    random.gauss(0.0, self.gps_jitter_m) / (111320.0 * coslat) * 1e7))
+            if spoof_this:
+                dlat_deg, dlon_deg, dvel_e_mps = self._current_spoof_offset()
+                msg.lat += int(round(dlat_deg * 1e7))
+                msg.lon += int(round(dlon_deg * 1e7))
+                if dvel_e_mps != 0.0:
+                    self._rewrite_velocity_east(msg, mt, dvel_e_mps)
             # Re-encode against the relay's own mav so the CRC is recomputed.
             # Use the original sender's sysid/compid so the detector's sysid
             # filter still accepts it (the autopilot is sysid 1).
@@ -564,6 +603,12 @@ def main():
     ap.add_argument("--px4-ev-fallback", action="store_true",
                     help="PX4 only: inject external-vision position so PX4 holds "
                          "armed RTL after the GPS sever (enables ActionAcked).")
+    # Receiver-noise model (metres, 1-sigma per horizontal axis) applied to the
+    # DETECTOR-bound GPS_RAW_INT stream. Needed for simulators whose GPS is
+    # noiseless (gz navsat): bit-identical fixes while the vehicle climbs are
+    # indistinguishable from a frozen/replay attack, so the detector (correctly)
+    # latched FrozenGps mid-takeoff. Real receivers always jitter; 0 = off.
+    ap.add_argument("--gps-jitter-m", type=float, default=0.0)
     args = ap.parse_args()
 
     # Param mode needs the watch window to outlast the ramp plus a detection
@@ -578,6 +623,10 @@ def main():
             args.watch_secs = needed
 
     r = Relay(args.sitl, args.det_host, args.det_port)
+    if args.gps_jitter_m > 0.0:
+        r.gps_jitter_m = args.gps_jitter_m
+        log("GPS receiver-noise model ON: {:.2f} m 1-sigma/axis on the "
+            "detector-bound GPS_RAW_INT".format(args.gps_jitter_m))
     r.start()
     log("relay started (SITL<->detector both directions)")
 
@@ -766,7 +815,7 @@ def main():
     while time.time() < t_end:
         time.sleep(1)
     mode_before = r.last_mode
-    log("mode before spoof = {} ({})".format(mode_before, MODE_NAMES.get(mode_before, "?")))
+    log("mode before spoof = {} ({})".format(mode_before, mode_name(args.vehicle, mode_before)))
 
     # Inject the spoof. Convert the desired east offset (metres) to degrees of
     # longitude at the home latitude: dlon_deg = metres / (111320 * cos(lat)).
@@ -856,7 +905,7 @@ def main():
         # drop its absolute-position lane (pos_horiz_abs clears)?
         if now - last_ekf_log >= 5.0:
             log("  t+{:.0f}s mode={} {}".format(
-                now - spoof_t, MODE_NAMES.get(r.last_mode, "?"), r.ekf_summary()))
+                now - spoof_t, mode_name(args.vehicle, r.last_mode), r.ekf_summary()))
             last_ekf_log = now
         if rtl_at is None and is_rtl_equiv(args.vehicle, r.last_mode):
             rtl_at = now
@@ -872,7 +921,7 @@ def main():
 
     final = r.last_mode
     log("final mode = {} ({}) | {}".format(
-        final, MODE_NAMES.get(final, "?"), r.ekf_summary()))
+        final, mode_name(args.vehicle, final), r.ekf_summary()))
     log("fwd SITL->det={} det->SITL={}".format(r._fwd_to_det, r._fwd_to_sitl))
     r.stop()
 
