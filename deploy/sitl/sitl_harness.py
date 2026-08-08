@@ -716,6 +716,32 @@ def main():
                     0, m, 1e6, 0, 0, 0, 0, 0))
                 time.sleep(0.3)
         time.sleep(3)  # let params apply / GCS link register
+        # EV fallback goes live BEFORE arming (a real companion vision system
+        # runs from boot, not mid-climb). This also stabilizes the flight: with
+        # GPS as the only aid, this image's EKF sat in const-pos mode and the
+        # takeoff position-controller chased a pinned estimate — the vehicle
+        # slid away at ~5 m/s from liftoff (observed live 2026-08-08: a real
+        # 50 m runaway the detector rightly flagged as anomalous, latching
+        # BEFORE the scripted spoof). A fused EV lane keeps the estimator
+        # tracking reality so AUTO.TAKEOFF actually holds position.
+        if args.px4_ev_fallback:
+            log("PX4 EV fallback (pre-arm): EKF2_EV_CTRL=11 (fuse external vision)")
+            for _ in range(3):
+                r.set_param_int("EKF2_EV_CTRL", 11)
+                r.set_param_int("EKF2_EV_NOISE_MD", 0)  # param noise, not msg cov [INT32]
+                r.set_param("EKF2_EVP_NOISE", 0.1)  # 0.1 m EV position noise [REAL32]
+                time.sleep(0.5)
+            gpos_deadline = time.time() + 60
+            while time.time() < gpos_deadline and r.true_lat is None:
+                time.sleep(0.5)
+            if r.enable_ev_fallback():
+                log("EV fallback: letting the EKF fuse vision for 8 s before arming")
+                time.sleep(8)
+        # Anchor home at the CURRENT position (same as the ArduPilot path) so
+        # the RTL destination is exactly where we arm.
+        r.send_as_gcs(lambda: r.sitl.mav.command_long_send(
+            sysid, compid, mavutil.mavlink.MAV_CMD_DO_SET_HOME,
+            0, 1, 0, 0, 0, 0, 0, 0))
         # THE core fix for the blind-land failure chain: do NOT force-arm past an
         # EKF that has no valid position. Wait for genuine EKF validity first —
         # arming into AUTO.TAKEOFF without a local position made mc_pos_control
@@ -803,28 +829,18 @@ def main():
     # time, stretching the climb in wall-clock terms.
     r.wait_airborne(args.takeoff_alt * 0.5, timeout=90 if is_px4 else 40)
 
-    # PX4 ActionAcked fallback: give PX4 a non-GPS position source so it can hold
-    # an armed RTL after the detector severs GPS (otherwise PX4 loses position ->
-    # LANDs+disarms -> the detector's armed cross-check correctly returns
-    # ActionUnconfirmed, the C-15 trade-off). Configure EKF2 to fuse external
-    # vision, then stream a true-position VISION_POSITION_ESTIMATE (the relay
-    # thread, _send_ev). Opt-in + PX4-only; the detector is untouched.
-    if is_px4 and args.px4_ev_fallback:
-        # EKF2_EV_CTRL is the modern (>=1.13) external-vision bitmask:
-        #   bit0(1)=horizontal position, bit1(2)=vertical position,
-        #   bit2(4)=velocity, bit3(8)=yaw. 11 = horiz+vert pos + yaw.
-        # (The pre-1.13 EKF2_AID_MASK is intentionally NOT set — live SITL logged
-        # "unknown param: EKF2_AID_MASK", i.e. this firmware is >=1.13, matching
-        # the EKF2_GPS_CTRL sever path. Setting it only spammed mavlink errors.)
-        log("PX4 EV fallback: EKF2_EV_CTRL=11 (fuse external vision)")
-        for _ in range(3):
-            r.set_param_int("EKF2_EV_CTRL", 11)
-            r.set_param_int("EKF2_EV_NOISE_MD", 0)  # param noise below, not msg cov [INT32]
-            r.set_param("EKF2_EVP_NOISE", 0.1)  # 0.1 m EV position noise [REAL32]
-            time.sleep(0.5)
+    # PX4 ActionAcked fallback (see the pre-arm block above): the EV stream —
+    # EKF2_EV_CTRL=11 (bit0 horiz pos + bit1 vert pos + bit3 yaw; the pre-1.13
+    # EKF2_AID_MASK is unknown on this firmware and not set) plus a
+    # true-position VISION_POSITION_ESTIMATE (relay thread, _send_ev) — gives
+    # PX4 a non-GPS position source so it can hold an armed RTL after the
+    # detector severs GPS (otherwise PX4 loses position -> LANDs+disarms ->
+    # the detector's armed cross-check correctly returns ActionUnconfirmed,
+    # the C-15 trade-off). Normally enabled BEFORE arming; this is only the
+    # retry for the corner where no GLOBAL_POSITION_INT had arrived pre-arm.
+    if is_px4 and args.px4_ev_fallback and not r.ev_active:
+        log("PX4 EV fallback: pre-arm enable had no position yet; retrying airborne")
         if r.enable_ev_fallback():
-            # Let the EKF fuse EV alongside GPS for a few seconds before the
-            # spoof, so the EV lane is already converged when GPS is severed.
             log("EV fallback: letting EKF converge on vision for 8 s before the spoof")
             time.sleep(8)
 
