@@ -206,6 +206,15 @@ class Relay:
         # Latest COMMAND_ACK result per command id — lets the choreography see
         # WHY an arm was rejected instead of blindly retrying.
         self.cmd_acks = {}
+        # Serializes every pack/send on the SHARED self.sitl.mav object. The
+        # relay thread's GPS re-encoder stamps srcSystem=1 (the autopilot's
+        # identity, so the detector's sysid filter accepts the forwarded fix)
+        # on EVERY jittered/spoofed message, while the main thread packs
+        # choreography commands on the same object — unserialized, an arm
+        # command can pack as sysid 1 and PX4 DROPS it: "ignoring CMD with
+        # same SYS/COMP (1/1) ID" (observed live 2026-08-08: a whole leg never
+        # armed because it lost this race for 65 s straight).
+        self.mav_lock = threading.Lock()
 
     def _current_spoof_offset(self):
         """(dlat_deg, dlon_deg, dvel_e_mps) for this instant. The step relay
@@ -270,10 +279,14 @@ class Relay:
                     self._rewrite_velocity_east(msg, mt, dvel_e_mps)
             # Re-encode against the relay's own mav so the CRC is recomputed.
             # Use the original sender's sysid/compid so the detector's sysid
-            # filter still accepts it (the autopilot is sysid 1).
-            self.sitl.mav.srcSystem = msg.get_srcSystem()
-            self.sitl.mav.srcComponent = msg.get_srcComponent()
-            return msg.pack(self.sitl.mav)
+            # filter still accepts it (the autopilot is sysid 1). Locked —
+            # the main thread packs GCS-stamped (sysid 255) choreography on
+            # this same object, and an interleaved srcSystem write makes one
+            # side or the other emit with the wrong identity.
+            with self.mav_lock:
+                self.sitl.mav.srcSystem = msg.get_srcSystem()
+                self.sitl.mav.srcComponent = msg.get_srcComponent()
+                return msg.pack(self.sitl.mav)
         except Exception:
             # On any re-encode hiccup, fall back to forwarding the original so
             # the stream never stalls.
@@ -378,6 +391,25 @@ class Relay:
                     self._send_gcs_heartbeat()
             time.sleep(0.002)
 
+    def send_as_gcs(self, send_fn, src_component=None):
+        """Pack+send a harness-originated message with the GCS identity
+        (sysid 255), serialized against the relay thread's GPS re-encoder
+        (which stamps srcSystem=1 to preserve the autopilot's identity on
+        forwarded fixes). Without the lock+stamp, a choreography command can
+        pack as sysid 1 and PX4 silently DROPS it — "ignoring CMD with same
+        SYS/COMP (1/1) ID" — which left a whole leg unarmed (live 2026-08-08).
+        Swallows send errors: choreography retries, and an exception must
+        never kill the relay pump when called from that thread."""
+        if src_component is None:
+            src_component = mavutil.mavlink.MAV_COMP_ID_MISSIONPLANNER
+        with self.mav_lock:
+            self.sitl.mav.srcSystem = 255
+            self.sitl.mav.srcComponent = src_component
+            try:
+                send_fn()
+            except Exception:
+                pass
+
     def _send_ev(self):
         """Send one VISION_POSITION_ESTIMATE (NED rel. to ev_origin) to PX4."""
         lat0, lon0 = self.ev_origin
@@ -390,44 +422,30 @@ class Relay:
         cov = [0.0] * 21
         cov[0] = cov[6] = cov[11] = 0.01  # x,y,z position variance (m^2)
         cov[15] = cov[18] = cov[20] = 0.05  # roll,pitch,yaw variance
-        # Send as a GCS/companion sysid, not the autopilot's, so PX4 treats it as
-        # an external source. (Sequential within this thread with the spoof
-        # re-encode, which sets srcSystem right before it packs.)
-        self.sitl.mav.srcSystem = 255
-        self.sitl.mav.srcComponent = 200
         # The VISION_POSITION_ESTIMATE covariance + reset_counter are MAVLink2
         # EXTENSION fields whose presence in the generated `_send` signature varies
         # by pymavlink version. Try the modern 9-arg form (with covariance), then
-        # fall back to the 7-arg form — and swallow EVERYTHING, because an
-        # unhandled exception here would kill the relay pump thread and stop ALL
-        # forwarding. (EKF2_EV_NOISE_MD=0 + EKF2_EVP_NOISE makes the EKF use a
-        # param-based noise, so the message covariance isn't load-bearing anyway.)
-        for send in (
-            lambda: self.sitl.mav.vision_position_estimate_send(
-                usec, north, east, down, 0.0, 0.0, 0.0, cov, 0),
-            lambda: self.sitl.mav.vision_position_estimate_send(
-                usec, north, east, down, 0.0, 0.0, 0.0),
-        ):
+        # fall back to the 7-arg form; send_as_gcs (compid 200 = external vision
+        # source, distinct from the autopilot) swallows errors so nothing here can
+        # kill the relay pump. (EKF2_EV_NOISE_MD=0 + EKF2_EVP_NOISE makes the EKF
+        # use a param-based noise, so the message covariance isn't load-bearing.)
+        def _ev_send():
             try:
-                send()
-                return
+                self.sitl.mav.vision_position_estimate_send(
+                    usec, north, east, down, 0.0, 0.0, 0.0, cov, 0)
             except Exception:
-                continue
+                self.sitl.mav.vision_position_estimate_send(
+                    usec, north, east, down, 0.0, 0.0, 0.0)
+
+        self.send_as_gcs(_ev_send, src_component=200)
 
     def _send_gcs_heartbeat(self):
         """One MAV_TYPE_GCS heartbeat so PX4's datalink/GCS arming check passes.
-        Sent from a GCS sysid (255), distinct from the autopilot and the vision
-        source; srcSystem is reset per-message by the relay/EV packers, same as
-        _send_ev. Swallow-all so a transient send error can't kill the pump."""
-        self.sitl.mav.srcSystem = 255
-        self.sitl.mav.srcComponent = mavutil.mavlink.MAV_COMP_ID_MISSIONPLANNER
-        try:
-            self.sitl.mav.heartbeat_send(
-                mavutil.mavlink.MAV_TYPE_GCS,
-                mavutil.mavlink.MAV_AUTOPILOT_INVALID,
-                0, 0, mavutil.mavlink.MAV_STATE_ACTIVE)
-        except Exception:
-            pass
+        Sent with the GCS identity via send_as_gcs (locked + swallow-all)."""
+        self.send_as_gcs(lambda: self.sitl.mav.heartbeat_send(
+            mavutil.mavlink.MAV_TYPE_GCS,
+            mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+            0, 0, mavutil.mavlink.MAV_STATE_ACTIVE))
 
     # --- choreography helpers (run on main thread) ---
     def wait_gps(self, timeout=180):
@@ -466,9 +484,9 @@ class Relay:
     def set_param(self, name, value, param_type=None):
         if param_type is None:
             param_type = mavutil.mavlink.MAV_PARAM_TYPE_REAL32
-        self.sitl.mav.param_set_send(
+        self.send_as_gcs(lambda: self.sitl.mav.param_set_send(
             self.sitl.target_system, self.sitl.target_component,
-            name.encode("ascii"), float(value), param_type)
+            name.encode("ascii"), float(value), param_type))
 
     def set_param_int(self, name, value):
         """Set an INT32 param. PX4 rejects an int param sent as REAL32 with a
@@ -640,9 +658,9 @@ def main():
     if not is_px4:
         sysid0, compid0 = r.sitl.target_system, r.sitl.target_component
         for _ in range(3):
-            r.sitl.mav.request_data_stream_send(
+            r.send_as_gcs(lambda: r.sitl.mav.request_data_stream_send(
                 sysid0, compid0,
-                mavutil.mavlink.MAV_DATA_STREAM_ALL, 10, 1)  # 10 Hz, start
+                mavutil.mavlink.MAV_DATA_STREAM_ALL, 10, 1))  # 10 Hz, start
             time.sleep(1)
         log("requested all MAVLink data streams @10Hz")
 
@@ -693,9 +711,9 @@ def main():
         # estimator (every prior run logged "EKF_STATUS not yet seen").
         for mid in (230, 242):
             for _ in range(3):
-                r.sitl.mav.command_long_send(
+                r.send_as_gcs(lambda m=mid: r.sitl.mav.command_long_send(
                     sysid, compid, mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
-                    0, mid, 1e6, 0, 0, 0, 0, 0)
+                    0, m, 1e6, 0, 0, 0, 0, 0))
                 time.sleep(0.3)
         time.sleep(3)  # let params apply / GCS link register
         # THE core fix for the blind-land failure chain: do NOT force-arm past an
@@ -713,8 +731,8 @@ def main():
         arm_deadline = time.time() + 45
         last_ack = None
         while time.time() < arm_deadline and not r.is_armed():
-            r.sitl.mav.command_long_send(
-                sysid, compid, ARM_CMD, 0, 1, 0, 0, 0, 0, 0, 0)
+            r.send_as_gcs(lambda: r.sitl.mav.command_long_send(
+                sysid, compid, ARM_CMD, 0, 1, 0, 0, 0, 0, 0, 0))
             time.sleep(1.5)
             ack = r.cmd_acks.get(ARM_CMD)
             if ack is not None and ack != last_ack:
@@ -726,8 +744,8 @@ def main():
             log("PX4 normal arm not accepted; falling back to force-arm (21196)")
             arm_deadline = time.time() + 20
             while time.time() < arm_deadline and not r.is_armed():
-                r.sitl.mav.command_long_send(
-                    sysid, compid, ARM_CMD, 0, 1, 21196, 0, 0, 0, 0, 0)
+                r.send_as_gcs(lambda: r.sitl.mav.command_long_send(
+                    sysid, compid, ARM_CMD, 0, 1, 21196, 0, 0, 0, 0, 0))
                 time.sleep(1.5)
         log("PX4 armed={} ; AUTO.TAKEOFF mode + NAV_TAKEOFF to {} m (rel via "
             "MIS_TAKEOFF_ALT)".format(r.is_armed(), args.takeoff_alt))
@@ -736,13 +754,13 @@ def main():
             # MIS_TAKEOFF_ALT, which is RELATIVE — sidestepping NAV_TAKEOFF's
             # param7 AMSL-vs-relative ambiguity (30 read as AMSL is far below
             # Zurich's ~488 m ground, so the vehicle never climbed).
-            r.sitl.mav.command_long_send(
+            r.send_as_gcs(lambda: r.sitl.mav.command_long_send(
                 sysid, compid, mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0,
-                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 4, 2, 0, 0, 0, 0)
+                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 4, 2, 0, 0, 0, 0))
             # NAV_TAKEOFF as well (belt-and-suspenders).
-            r.sitl.mav.command_long_send(
+            r.send_as_gcs(lambda: r.sitl.mav.command_long_send(
                 sysid, compid, mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
-                0, 0, 0, 0, 0, 0, 0, args.takeoff_alt)
+                0, 0, 0, 0, 0, 0, 0, args.takeoff_alt))
             time.sleep(1.5)
     else:
         # ArduCopter: relax pre-arm checks + DO_SET_HOME, GUIDED, force-arm,
@@ -755,27 +773,28 @@ def main():
             r.set_param("ARMING_CHECK", 0)
             time.sleep(0.5)
         # MAV_CMD_DO_SET_HOME param1=1 -> use current location as home/origin.
-        r.sitl.mav.command_long_send(sysid, compid, mavutil.mavlink.MAV_CMD_DO_SET_HOME,
-                                     0, 1, 0, 0, 0, 0, 0, 0)
+        r.send_as_gcs(lambda: r.sitl.mav.command_long_send(
+            sysid, compid, mavutil.mavlink.MAV_CMD_DO_SET_HOME,
+            0, 1, 0, 0, 0, 0, 0, 0))
         time.sleep(8)  # let the EKF settle / set its origin with checks relaxed
         log("mode GUIDED (custom_mode=4)")
-        r.sitl.mav.set_mode_send(
-            sysid, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 4)
+        r.send_as_gcs(lambda: r.sitl.mav.set_mode_send(
+            sysid, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 4))
         time.sleep(3)
         # Force-arm (param2 = 21196 magic) and CONFIRM via the HEARTBEAT armed bit
         # before proceeding — a plain arm silently failed.
         log("force-arming (COMPONENT_ARM_DISARM param1=1 param2=21196)")
         arm_deadline = time.time() + 30
         while time.time() < arm_deadline and not r.is_armed():
-            r.sitl.mav.command_long_send(
+            r.send_as_gcs(lambda: r.sitl.mav.command_long_send(
                 sysid, compid, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-                0, 1, 21196, 0, 0, 0, 0, 0)
+                0, 1, 21196, 0, 0, 0, 0, 0))
             time.sleep(1.5)
         log("armed={} ; takeoff to {} m".format(r.is_armed(), args.takeoff_alt))
         for _ in range(3):
-            r.sitl.mav.command_long_send(
+            r.send_as_gcs(lambda: r.sitl.mav.command_long_send(
                 sysid, compid, mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
-                0, 0, 0, 0, 0, 0, 0, args.takeoff_alt)
+                0, 0, 0, 0, 0, 0, 0, args.takeoff_alt))
             time.sleep(1)
     # Confirm airborne so a later RTL keeps the vehicle armed through the
     # detector's read-back dwell (descending from altitude takes >> the 5 s
