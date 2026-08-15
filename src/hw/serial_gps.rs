@@ -324,6 +324,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unplug_mid_sentence_reports_eof_not_an_io_error() {
+        // REGRESSION: a module yanked mid-sentence leaves a partial line
+        // buffered, and `Decoder`'s default `decode_eof` turns that into
+        // `Err("bytes remaining on stream")` — so the commonest real
+        // disconnect surfaced as an opaque I/O string instead of a plain EOF.
+        // The fix earns its keep in the operator log, so assert the wording.
+        let mut bytes = GGA.to_vec();
+        bytes.extend_from_slice(b"$GPRMC,truncated-by-unplug");
+        let events = run(&bytes).await;
+        match events.as_slice() {
+            [SerialEvent::Fix(_), SerialEvent::Disconnected {
+                reason,
+                had_first_fix: true,
+            }] => assert!(
+                reason.contains("peer EOF"),
+                "a truncated tail is not a port failure, got reason {reason:?}"
+            ),
+            other => panic!("expected a fix then a clean EOF disconnect, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn binary_garbage_does_not_tear_down_a_working_connection() {
         // REGRESSION: the codec used to return `Err` on an over-long line,
         // and an `Err` from a `Decoder` terminates `FramedRead` for good — so

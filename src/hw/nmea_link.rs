@@ -140,6 +140,26 @@ impl Decoder for NmeaLineCodec {
         self.last_len = src.len();
         Ok(out)
     }
+
+    /// At EOF, drain any complete line, then DISCARD an unterminated tail
+    /// instead of erroring on it.
+    ///
+    /// The [`Decoder`] default turns leftover bytes into
+    /// `Err("bytes remaining on stream")`, which would break the contract
+    /// above through the back door: a module unplugged mid-sentence — the
+    /// commonest real disconnect there is — leaves a partial line buffered, so
+    /// the operator got that opaque string in place of "stream ended (peer
+    /// EOF)". A truncated sentence is incomplete DATA, not a port failure, and
+    /// its bytes are already counted in [`Self::bytes_seen`], so dropping it
+    /// costs the diagnosis no evidence.
+    fn decode_eof(&mut self, src: &mut BytesMut) -> Result<Option<NmeaLine>, std::io::Error> {
+        if let Some(item) = self.decode(src)? {
+            return Ok(Some(item));
+        }
+        src.clear();
+        self.last_len = 0;
+        Ok(None)
+    }
 }
 
 /// How recently something must have happened to still count as "flowing".
@@ -474,6 +494,28 @@ mod tests {
             feed(&mut c, &mut b, b"$GPGGA,back\n"),
             vec![s("$GPGGA,back")]
         );
+    }
+
+    #[test]
+    fn eof_drains_complete_lines_then_drops_an_unterminated_tail() {
+        // The `Decoder` default would turn the tail into `Err`, which this
+        // codec reserves for "the port is gone". A module unplugged
+        // mid-sentence must not be reported as an I/O failure.
+        let mut c = NmeaLineCodec::new();
+        let mut b = BytesMut::new();
+        b.extend_from_slice(b"$GPGGA,done\n$GPRMC,trunc");
+        assert_eq!(
+            c.decode_eof(&mut b).expect("eof must not error"),
+            Some(s("$GPGGA,done"))
+        );
+        assert_eq!(
+            c.decode_eof(&mut b).expect("eof must not error"),
+            None,
+            "the truncated tail is incomplete data, not a line and not an error"
+        );
+        assert!(b.is_empty(), "tail discarded");
+        // The tail's bytes still count, so the diagnosis keeps its evidence.
+        assert_eq!(c.bytes_seen(), 24);
     }
 
     #[test]
