@@ -408,17 +408,89 @@ and the closed-loop gate passes. Two concrete answers to the open questions:
   `ActionUnconfirmed` on a disarming autopilot is the deliberate C-15 safety
   trade-off (relaxing the armed gate would weaken the W-ARMED defence), so the
   fix is harness-side, not detector-side. `sitl_harness.py --px4-ev-fallback`
-  configures EKF2 to fuse external vision (`EKF2_EV_CTRL=11` / `EKF2_AID_MASK|=8`)
-  and streams a **true-position** `VISION_POSITION_ESTIMATE` at ~30 Hz (NED
-  relative to a captured origin; the EV goes only harness→PX4, the detector never
-  sees it). With a non-GPS position source, PX4 should hold an armed RTL after the
+  configures EKF2 to fuse external vision (`EKF2_EV_CTRL=11`; the pre-1.13
+  `EKF2_AID_MASK` is unknown on this firmware and no longer set) and streams a
+  **true-position** `VISION_POSITION_ESTIMATE` at ~30 Hz (NED relative to a
+  captured origin; the EV goes only harness→PX4, the detector never sees it).
+  With a non-GPS position source, PX4 should hold an armed RTL after the
   `EKF2_GPS_CTRL=0` sever and the read-back should reach `ActionAcked`. This runs
   as a **`continue-on-error`** job (`px4-action-acked` in
   [`sitl-px4.yml`](../.github/workflows/sitl-px4.yml)) with `REQUIRE_ACTION_ACKED=1`
   so it can never regress the proven `px4-closed-loop` gate while the EV-fusion
-  setup is tuned. **Status: implemented, pending nightly-CI validation** — PX4
-  SITL can't run on the Windows dev box, so the EKF2-EV params / message frames
-  may need an iteration or two against the live Gazebo image.
+  setup is tuned.
+
+### Findings — PX4 arm/takeoff choreography + first ActionAcked (2026-07 → 2026-08)
+
+Getting PX4 to genuinely FLY under the harness (the prerequisite for a truthful
+armed read-back) surfaced a chain of real findings, each observed live and fixed
+harness-side (the detector was correct throughout):
+
+- **Force-arm magic doesn't bypass PX4 health checks.** ArduPilot's
+  `param2=21196` convention is honored by PX4 only past *some* checks;
+  `commander: Arming denied: Resolve system health failures first` until the
+  harness (a) streams a `MAV_TYPE_GCS` heartbeat @1 Hz ("No connection to the
+  GCS" is an arming gate) and (b) clears the datalink-loss failsafe
+  (`NAV_DLL_ACT=0`).
+- **Never arm before the EKF has a valid position.** Force-arming past
+  `Preflight Fail: ekf2 missing data` let `AUTO.TAKEOFF` start position control
+  with no valid local position → `mc_pos_control: invalid setpoints` →
+  `Failsafe: blind land` seconds after `Takeoff detected`. The harness now waits
+  for EKF validity (`ESTIMATOR_STATUS` POS_HORIZ_ABS+POS_VERT_ABS, or
+  `HOME_POSITION` broadcast, or steady `LOCAL_POSITION_NED` +
+  `GLOBAL_POSITION_INT`), then arms **normally** — PX4 only ACCEPTs a normal arm
+  when its own health checks pass, so acceptance re-verifies readiness
+  (`Ready for takeoff!` → `Armed by external command`, climb to 31 m observed).
+- **PX4 never sends `EKF_STATUS_REPORT`** (that message is ArduPilot's); the
+  PX4 counterpart is `ESTIMATOR_STATUS`, which must be requested
+  (`MAV_CMD_SET_MESSAGE_INTERVAL`, id 230). The harness's estimator evidence was
+  blind on PX4 until this ("EKF_STATUS not yet seen" in every prior run).
+- **PX4 param typing is strict**: an INT32 param sent as REAL32 is rejected with
+  `param types mismatch` (bit ArduPilot never had). `COM_TKO_ALT` doesn't exist
+  on this firmware (`unknown param`) — the AUTO.TAKEOFF climb altitude comes
+  from `MIS_TAKEOFF_ALT`.
+- **A noiseless simulated GPS is indistinguishable from a replay attack.** The
+  gz-sim navsat plugin emits bit-identical lat/lon while the vehicle hovers or
+  climbs vertically — exactly the frozen-GPS signature (`FROZEN_FIX_RADIUS_M`
+  0.5 m, vs a real receiver's 1–2.5 m fix-to-fix jitter). On the first flying
+  run the detector **correctly** latched `FrozenGps` mid-climb, severed GPS and
+  commanded RTL before the scripted spoof — and in doing so achieved the
+  **first confirmed `ActionAcked` on live PX4** (armed RTL held through the
+  read-back dwell; `COM_DISARM_LAND=0` keeps PX4 armed after touchdown). The
+  fix is physical realism, not detector desensitization: `--gps-jitter-m` (1.0 m
+  1-sigma/axis in `run-px4-validation.sh`) adds receiver noise to the
+  detector-bound `GPS_RAW_INT` only. ArduPilot SITL already models GPS noise —
+  which is why its legs never hit this.
+- **`AUTO.DESCEND` (sub-mode 20) is a landing-class state the mode table
+  missed.** After the detector's GPS sever, PX4 downgrades an un-navigable RTL
+  to its position-less emergency descent and reports `0x14040000`
+  (`PX4_CUSTOM_SUB_MODE_AUTO_DESCEND=20`, appended upstream after our constants
+  were written). `is_rtl_mode` now accepts it (same trust class as the
+  already-accepted LAND) and the wire value is pinned in
+  `px4_split_mode_matches_real_sitl_wire_values`.
+- **Shared-mavlink-object identity race.** The relay re-encodes detector-bound
+  GPS with `srcSystem=1` (the autopilot's identity, required by the detector's
+  sysid filter) on its own thread; unserialized, a choreography command packed
+  on the same object could go out as sysid 1 and PX4 silently drops it —
+  `ignoring CMD with same SYS/COMP (1/1) ID` (one leg lost this race for its
+  whole 65 s arm window and never armed). All harness sends now go through
+  `send_as_gcs()` (lock + explicit sysid-255 stamp).
+- **Residual sim artifact (accepted, documented): the image's AUTO.TAKEOFF
+  runs away.** From the instant of liftoff the x500 slides SSW at a constant
+  ~5 m/s (course ~191°) while climbing — ~50 m by takeoff-complete — with
+  identical behavior whether external vision is fused from boot, mid-climb, or
+  not at all, so it is intrinsic to the image's flight dynamics/estimator on CI
+  runners, not an aiding-config problem. The detector latches Suspicious→Spoofed
+  on the honest GPS-vs-DR mismatch during this genuinely anomalous flight
+  (~2/3 of the motion is tracked by dead reckoning; the shortfall is consistent
+  with Madgwick attitude error under sustained tilt + linear acceleration),
+  BEFORE the scripted spoof is injected. Consequence for the `px4-action-acked`
+  leg: it is GREEN and proves everything it exists to prove — normal
+  health-checked arming, real flight, detection→sever→RTL, PX4 holding an armed
+  RTL-equivalent through the read-back dwell, `ActionAcked` confirmed — but the
+  detection trigger is the runaway rather than the scripted wire spoof. On real
+  hardware this latch shape does not arise: a real IMU feels a real runaway, DR
+  tracks it, and the residual stays small. The validated no-false-latch envelope
+  (realistic noise, turns, long linear flight) is unchanged.
 
 ## When SITL passes, what's next
 

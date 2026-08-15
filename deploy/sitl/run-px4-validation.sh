@@ -28,7 +28,18 @@ CLEAN_SECS="${CLEAN_SECS:-25}"
 WATCH_SECS="${WATCH_SECS:-70}"
 SPOOF_MODE="${SPOOF_MODE:-relay}"
 GLITCH_RAMP_SECS="${GLITCH_RAMP_SECS:-60}"
-DETECTOR_DURATION="${DETECTOR_DURATION:-320}"
+# Receiver-noise model on the detector-bound GPS (metres, 1-sigma/axis). The gz
+# navsat GPS is NOISELESS — bit-identical fixes during the takeoff climb are
+# indistinguishable from a frozen/replay attack, so the detector (correctly)
+# latched FrozenGps mid-climb and RTL'd before the scripted spoof (live
+# 2026-08-08). 1.0 m models a real receiver; ArduPilot SITL needs none (its sim
+# GPS already jitters, which is why its legs never hit this).
+GPS_JITTER_M="${GPS_JITTER_M:-1.0}"
+# Must outlast the WHOLE choreography: boot(75) + GPS wait + params + the EKF
+# readiness wait (<=150s) + arm (<=65s) + takeoff (<=90s) + EV settle + clean +
+# watch + verify grace. The detector exiting early (duration elapsed) mid-run
+# looks like a detection failure — keep this comfortably above the worst case.
+DETECTOR_DURATION="${DETECTOR_DURATION:-560}"
 IMU_RATE="${IMU_RATE:-50}"
 # Experimental PX4 ActionAcked path (opt-in). When set, the harness injects an
 # external-vision position so PX4 keeps a non-GPS position estimate after the GPS
@@ -95,6 +106,11 @@ fi
 
 echo "[px4] launching harness at $HARNESS_IP (binds udpin:14540, flies PX4, spoofs, watches)"
 set +e
+# Tee the harness stdout into the artifact dir as well. It carries the PX4-SIDE
+# truth — EV-fallback status, the periodic EKF_STATUS_REPORT summary (whether the
+# vision position was actually fused vs. const-pos after the sever), and arm/
+# disarm — which the flaky GitHub Actions log API frequently refuses to return.
+# PIPESTATUS[0] keeps HARNESS_RC as the harness's exit code, not tee's.
 docker run --rm --name fs-harness --network "$NET" --ip "$HARNESS_IP" \
     "$HARNESS_IMAGE" \
     --sitl udpin:0.0.0.0:14540 \
@@ -102,8 +118,9 @@ docker run --rm --name fs-harness --network "$NET" --ip "$HARNESS_IP" \
     --vehicle px4 \
     --glitch-m "$GLITCH_M" --home-lat "$HOME_LAT" \
     --spoof-mode "$SPOOF_MODE" --glitch-ramp-secs "$GLITCH_RAMP_SECS" \
-    --clean-secs "$CLEAN_SECS" --watch-secs "$WATCH_SECS" $EV_ARG
-HARNESS_RC=$?
+    --gps-jitter-m "$GPS_JITTER_M" \
+    --clean-secs "$CLEAN_SECS" --watch-secs "$WATCH_SECS" $EV_ARG 2>&1 | tee "$OUT_DIR/harness.log"
+HARNESS_RC=${PIPESTATUS[0]}
 set -e
 
 echo ""
@@ -111,6 +128,17 @@ echo ""
 # API has been flaky for these runs, so the downloadable detector.log is the
 # reliable place to read the gate-by-gate "MAV VERIFY" line from.
 docker logs fs-detector > "$OUT_DIR/detector.log" 2>&1 || true
+# Capture PX4's OWN console too. It states the EKF vision-fusion state and the
+# exact reason an EV-fallback run did or didn't hold an armed RTL — "EKF commander:
+# ... GPS fusion", "Landing detected", "Disarmed", or a GPS-loss failsafe. This is
+# what distinguishes "EV never fused -> failsafe land" from "EV fused, RTL flew home
+# and landed" (opposite fixes), so it must be in the artifact, not the flaky job log.
+# SANITIZED: the raw stream is ~800 MB of "pxh> " prompt-redraw + ANSI-erase spam
+# (observed live — it swamped the uploaded artifact); normalize \r to \n, strip
+# ANSI escapes and the pxh> prompts, drop blank lines, and cap as a backstop.
+docker logs fs-px4 2>&1 | tr -d '\000' | tr '\r' '\n' \
+    | sed -e $'s/\x1b\\[[0-9;]*[A-Za-z]//g' -e 's/pxh> //g' -e '/^[[:space:]]*$/d' \
+    | tail -c 50M > "$OUT_DIR/px4.log" || true
 echo "==================== detector log (last 70 lines) ===================="
 tail -70 "$OUT_DIR/detector.log"
 

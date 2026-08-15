@@ -28,18 +28,30 @@ pub const ARDUCOPTER_MODE_LAND: u32 = 9; // also acceptable as "the autopilot go
 ///                              RTL=5, LAND=6, RTGS=7, FOLLOW_TARGET=8)
 ///   bits 15..0  = reserved
 ///
-/// "RTL engaged" for PX4 = `main_mode=AUTO` AND `sub_mode ∈ {RTL, LAND, RTGS}`.
-/// Source: PX4 Firmware `src/modules/commander/px4_custom_mode.h` (the union is
-/// little-endian: `main_mode` is byte 2, `sub_mode` byte 3). VERIFIED against
-/// live PX4 SITL wire values — AUTO.LOITER=0x03040000, AUTO.TAKEOFF=0x02040000,
-/// AUTO.RTL=0x05040000. (A prior version had main/sub byte positions SWAPPED;
-/// the self-consistent round-trip unit test couldn't see it, but a real PX4 SITL
-/// RTL then read as a non-AUTO mode and verification reported ActionUnconfirmed
-/// even though PX4 had reached AUTO.RTL.)
+/// "RTL engaged" for PX4 = `main_mode=AUTO` AND `sub_mode ∈ {RTL, LAND, RTGS,
+/// DESCEND}`. Source: PX4 Firmware `src/modules/commander/px4_custom_mode.h`
+/// (the union is little-endian: `main_mode` is byte 2, `sub_mode` byte 3).
+/// VERIFIED against live PX4 SITL wire values — AUTO.LOITER=0x03040000,
+/// AUTO.TAKEOFF=0x02040000, AUTO.RTL=0x05040000, AUTO.DESCEND=0x14040000.
+/// (A prior version had main/sub byte positions SWAPPED; the self-consistent
+/// round-trip unit test couldn't see it, but a real PX4 SITL RTL then read as a
+/// non-AUTO mode and verification reported ActionUnconfirmed even though PX4
+/// had reached AUTO.RTL.)
+///
+/// DESCEND (`PX4_CUSTOM_SUB_MODE_AUTO_DESCEND` = 20, appended upstream after
+/// the first three constants were written) is PX4's position-LESS emergency
+/// descent — the failsafe it falls into when it cannot navigate an RTL (e.g.
+/// after this detector's GPS sever removes its only position source; observed
+/// live 2026-08-08: RTL -> "mc_pos_control: invalid setpoints" -> "Failsafe:
+/// blind land" -> 0x14040000). It is a landing-class, GPS-independent state —
+/// same trust class as LAND, which is already accepted — so treating it as
+/// RTL-equivalent keeps the read-back truthful when PX4 downgrades RTL to an
+/// emergency descent mid-dwell.
 pub const PX4_MAIN_MODE_AUTO: u8 = 4;
 pub const PX4_SUB_MODE_AUTO_RTL: u8 = 5;
 pub const PX4_SUB_MODE_AUTO_LAND: u8 = 6;
 pub const PX4_SUB_MODE_AUTO_RTGS: u8 = 7;
+pub const PX4_SUB_MODE_AUTO_DESCEND: u8 = 20;
 
 /// Extract (main, sub) from a PX4 `custom_mode` value. `main_mode` is bits
 /// 16..23, `sub_mode` is bits 24..31 (PX4's `px4_custom_mode` union).
@@ -99,7 +111,7 @@ impl std::str::FromStr for VehicleProfile {
 /// True if `custom_mode` represents an RTL-equivalent state for `profile`.
 ///
 ///   ArduCopter: flat enum, RTL (6) / SMART_RTL (21) / LAND (9).
-///   PX4:        packed `(main, sub)`, AUTO+{RTL, LAND, RTGS}.
+///   PX4:        packed `(main, sub)`, AUTO+{RTL, LAND, RTGS, DESCEND}.
 ///
 /// We accept LAND-class states as "RTL engaged" because the operator
 /// intent — the drone is no longer being navigated by the (potentially
@@ -116,7 +128,10 @@ pub fn is_rtl_mode(profile: VehicleProfile, custom_mode: u32) -> bool {
             main == PX4_MAIN_MODE_AUTO
                 && matches!(
                     sub,
-                    PX4_SUB_MODE_AUTO_RTL | PX4_SUB_MODE_AUTO_LAND | PX4_SUB_MODE_AUTO_RTGS
+                    PX4_SUB_MODE_AUTO_RTL
+                        | PX4_SUB_MODE_AUTO_LAND
+                        | PX4_SUB_MODE_AUTO_RTGS
+                        | PX4_SUB_MODE_AUTO_DESCEND
                 )
         }
     }
@@ -671,6 +686,12 @@ mod tests {
             p,
             px4_encode_mode(PX4_MAIN_MODE_AUTO, PX4_SUB_MODE_AUTO_RTGS)
         ));
+        // AUTO + DESCEND (position-less emergency descent — landing-class,
+        // GPS-independent; PX4 falls into it when it can't navigate an RTL)
+        assert!(is_rtl_mode(
+            p,
+            px4_encode_mode(PX4_MAIN_MODE_AUTO, PX4_SUB_MODE_AUTO_DESCEND)
+        ));
         // AUTO + LOITER — NOT RTL
         assert!(!is_rtl_mode(p, px4_encode_mode(PX4_MAIN_MODE_AUTO, 3)));
         // POSCTL (main=3) + anything — NOT RTL
@@ -705,6 +726,15 @@ mod tests {
             px4_encode_mode(PX4_MAIN_MODE_AUTO, PX4_SUB_MODE_AUTO_RTL),
             0x0504_0000
         );
+        // AUTO.DESCEND, observed live 2026-08-08: after the detector's GPS
+        // sever, PX4 downgraded its RTL to a position-less blind land and
+        // reported 0x14040000 (sub 20) — a landing-class state that MUST read
+        // as RTL-equivalent or the read-back lies about a correct outcome.
+        assert_eq!(
+            px4_split_mode(0x1404_0000),
+            (PX4_MAIN_MODE_AUTO, PX4_SUB_MODE_AUTO_DESCEND)
+        );
+        assert!(is_rtl_mode(VehicleProfile::Px4, 0x1404_0000));
     }
 
     #[test]
