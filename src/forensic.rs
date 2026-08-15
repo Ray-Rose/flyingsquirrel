@@ -392,6 +392,30 @@ pub async fn dump_to_disk(snap: &ForensicSnapshot, dir: &Path) -> Result<PathBuf
             ))
         })?;
 
+    // Durability (audit D3): `sync_all` above persisted the file CONTENTS,
+    // but the rename lives in the parent directory's metadata, which needs
+    // its own fsync on Linux — a power cut in this window could otherwise
+    // lose the fully-written dump on an SBC's SD card. Best-effort: the
+    // dump already exists and is complete; a failed directory sync only
+    // weakens crash durability and must not turn a successful dump into an
+    // error path. (Windows has no directory-handle fsync via std; dev-only
+    // platform, deploy target is Linux.)
+    #[cfg(unix)]
+    match tokio::fs::File::open(dir).await {
+        Ok(d) => {
+            if let Err(e) = d.sync_all().await {
+                tracing::warn!(
+                    dir = %dir.display(), error = %e,
+                    "forensic parent-dir fsync failed; dump durable only after next FS sync"
+                );
+            }
+        }
+        Err(e) => tracing::warn!(
+            dir = %dir.display(), error = %e,
+            "forensic parent-dir open-for-fsync failed; dump durable only after next FS sync"
+        ),
+    }
+
     Ok(final_path)
 }
 
