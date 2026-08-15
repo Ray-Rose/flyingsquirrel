@@ -19,7 +19,7 @@
 # for humans; Docker resolves by digest. Dependabot (.github/dependabot.yml,
 # docker ecosystem) opens a PR when the base image updates, so the pin stays
 # current instead of freezing security patches.
-FROM rust:1.88-slim-bookworm@sha256:38bc5a86d998772d4aec2348656ed21438d20fcdce2795b56ca434cf21430d89 AS builder
+FROM rust:1.97-slim-bookworm@sha256:2775a09d208ff0d7c1f50490c45b62db929e87ba1dcbc3f2132ac71a704bcdd3 AS builder
 
 # Build deps:
 #   pkg-config / libudev-dev   — hw-i2c via linux-embedded-hal
