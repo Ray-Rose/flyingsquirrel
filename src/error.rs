@@ -27,6 +27,11 @@ pub enum FsError {
 pub enum IngestError {
     #[error("nmea parse: {0}")]
     NmeaParse(String),
+    /// I2C sensor bus failure (open/init/identity). Previously these were
+    /// mislabeled `NmeaParse`, which made operator logs point at the wrong
+    /// subsystem during hardware bring-up.
+    #[error("i2c: {0}")]
+    I2c(String),
     #[error("source ended")]
     SourceEnded,
 }

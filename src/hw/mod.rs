@@ -15,5 +15,11 @@ pub mod serial_gps;
 /// applied on the Linux I2C path today.
 pub mod axis_map;
 
+/// MPU-6050 register decode, WHO_AM_I identity check, and the read-health
+/// escalation ladder (degraded-warn → in-process re-init → stream-end).
+/// Pure logic, not feature-gated — same rationale as `axis_map`: the policy
+/// is unit-tested on every platform; only the bus I/O is Linux-gated.
+pub mod mpu6050;
+
 #[cfg(all(feature = "hw-i2c", target_os = "linux"))]
 pub mod i2c_imu;
