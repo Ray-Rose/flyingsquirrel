@@ -24,6 +24,14 @@ spoof-*.json
 __pycache__/
 *.pyc
 
+# cargo-fuzz output. The SEED corpus under fuzz/corpus/ IS committed (it
+# bootstraps coverage on a cold CI runner); the mutator's own accumulated
+# inputs, build tree, and crash artifacts are not. A crash artifact worth
+# keeping gets promoted into a regression test, not committed here.
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/coverage/
+
 # Editor / OS cruft
 *.swp
 *~

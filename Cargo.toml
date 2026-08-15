@@ -18,6 +18,9 @@ homepage = "https://github.com/Ray-Rose/flyingsquirrel"
 readme = "README.md"
 keywords = ["gps", "spoofing", "drone", "mavlink", "security"]
 categories = ["aerospace", "embedded"]
+# The fuzz crate is a detached workspace (nightly + libFuzzer only); it is a
+# development harness, not part of the published package.
+exclude = ["fuzz/"]
 
 [lib]
 name = "flyingsquirrel"

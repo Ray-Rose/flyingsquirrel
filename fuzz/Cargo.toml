@@ -1,0 +1,51 @@
+[package]
+name = "flyingsquirrel-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Detached from the parent package's build: `cargo test` / `cargo build` at the
+# repo root must never try to compile these targets, which need a nightly
+# toolchain and libFuzzer's sanitizer instrumentation.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+mavlink = { version = "0.13", default-features = false, features = ["common", "std"] }
+tokio = { version = "1.40", features = ["time"] }
+# Same feature set as the parent crate: the `GNSS` bundle is what makes
+# GGA/RMC/VTG decodable at all (audit I-01). Fuzzing with the default features
+# would exercise a parser that rejects every real sentence.
+nmea = { version = "0.7", default-features = false, features = ["std", "GNSS"] }
+
+[dependencies.flyingsquirrel]
+path = ".."
+
+# Fuzz builds are throwaway binaries: optimize them, but keep debug info so a
+# crash artifact yields a usable symbolized stack.
+[profile.release]
+debug = 1
+
+# Each target is declared explicitly (cargo-fuzz's `test = false` /
+# `doc = false` convention keeps them out of the normal test/doc harness).
+[[bin]]
+name = "nmea_parse"
+path = "fuzz_targets/nmea_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "clock_aligner"
+path = "fuzz_targets/clock_aligner.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "mav_ingest"
+path = "fuzz_targets/mav_ingest.rs"
+test = false
+doc = false
