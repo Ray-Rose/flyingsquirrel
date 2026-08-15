@@ -65,7 +65,7 @@ mavlink = { version = "0.13", default-features = false, features = ["common", "s
 tokio-serial = "5.4"
 tokio-util = { version = "0.7", features = ["codec"] }
 bytes = "1"
-toml = "0.8"
+toml = "1.1"
 sha2 = "0.10"
 ratatui = "0.29"
 crossterm = "0.28"
