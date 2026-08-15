@@ -10,6 +10,12 @@
 
 pub mod serial_gps;
 
+/// NMEA byte framing + link-health diagnosis for the serial GPS path. Pure
+/// logic, not feature-gated — same rationale as `mpu6050` below: `serial_gps`
+/// owns the port, this owns what the bytes mean, and only the latter can be
+/// unit-tested without the hardware attached.
+pub mod nmea_link;
+
 /// Sensor-to-body axis remap (for arbitrarily-mounted IMUs). Not feature-gated
 /// so the remap math is unit-tested on every platform, even though it is only
 /// applied on the Linux I2C path today.

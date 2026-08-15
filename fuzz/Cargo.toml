@@ -17,6 +17,12 @@ libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 mavlink = { version = "0.13", default-features = false, features = ["common", "std"] }
 tokio = { version = "1.40", features = ["time"] }
+# Needed to drive the REAL `NmeaLineCodec` (a `tokio_util::codec::Decoder`
+# over a `BytesMut`) instead of re-implementing its framing rules here. Same
+# semver ranges as the parent crate so the lockfile unifies them — a second
+# `bytes` version would make the `BytesMut` types incompatible.
+bytes = "1"
+tokio-util = { version = "0.7", features = ["codec"] }
 # Same feature set as the parent crate: the `GNSS` bundle is what makes
 # GGA/RMC/VTG decodable at all (audit I-01). Fuzzing with the default features
 # would exercise a parser that rejects every real sentence.

@@ -31,10 +31,14 @@ on:
     branches: ["**"]
     paths:
       # Build-check only where it can actually break: the fuzz crate itself,
-      # the decode paths under test, or the workflow.
+      # the decode paths under test, or the workflow. `src/hw/**` is in the
+      # list because `nmea_parse` drives the real `NmeaLineCodec` — a refactor
+      # there that stopped compiling against the target is precisely the
+      # bitrot this job exists to catch.
       - "fuzz/**"
       - "src/mav/**"
       - "src/ingest/**"
+      - "src/hw/**"
       - "src/types.rs"
       - ".github/workflows/fuzz.yml"
   pull_request:
@@ -42,6 +46,7 @@ on:
       - "fuzz/**"
       - "src/mav/**"
       - "src/ingest/**"
+      - "src/hw/**"
       - "src/types.rs"
       - ".github/workflows/fuzz.yml"
 

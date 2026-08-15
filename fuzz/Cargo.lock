@@ -494,11 +494,13 @@ name = "flyingsquirrel-fuzz"
 version = "0.0.0"
 dependencies = [
  "arbitrary",
+ "bytes",
  "flyingsquirrel",
  "libfuzzer-sys",
  "mavlink",
  "nmea",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
