@@ -6,8 +6,8 @@
 //! a wide random input space, not just hand-picked examples. Each property
 //! below is a structural invariant that must hold for ALL inputs in range.
 
-use flyingsquirrel::mav::gps_fix_is_plausible;
 use flyingsquirrel::mav::monitor::{is_rtl_mode, px4_encode_mode, px4_split_mode, VehicleProfile};
+use flyingsquirrel::mav::{gps_fix_is_plausible, ClockAligner};
 use flyingsquirrel::nav::{lla_to_ned, R_EARTH_M};
 use flyingsquirrel::sim::ned_to_lla;
 use flyingsquirrel::types::{GpsFix, Timestamp};
@@ -104,6 +104,43 @@ proptest! {
         alt in -1000.0f64..1000.0,
     ) {
         prop_assert!(!gps_fix_is_plausible(&fix(lat, lon, alt)));
+    }
+
+    /// `ClockAligner::align` must never panic and must never return a stamp
+    /// more than `CLOCK_ALIGN_MAX_SKEW` (2 s) ahead of the arrival that
+    /// produced it — for ANY sequence of attacker-controlled sensor
+    /// timestamps.
+    ///
+    /// This is the invariant whose violation was a REAL one-packet remote DoS:
+    /// a crafted `time_usec` made `anchor_arrival + Duration::from_micros(..)`
+    /// overflow the monotonic `Instant` and PANIC, killing the listener task
+    /// and with it the whole detector. The unbounded-lead half matters too — a
+    /// hostile clock that could shift GPS relative to IMU would inject
+    /// residual (the detector's core signal) without touching a coordinate.
+    ///
+    /// The `fuzz/` harness covers this same surface with coverage guidance,
+    /// but only on Linux CI (libFuzzer cannot link on Windows MSVC). This
+    /// property runs everywhere, on every push.
+    #[test]
+    fn clock_aligner_never_leads_arrival_beyond_skew_bound(
+        ops in prop::collection::vec((any::<Option<u64>>(), 0u32..5_000_000), 1..64)
+    ) {
+        const MAX_SKEW: std::time::Duration = std::time::Duration::from_secs(2);
+        let mut aligner = ClockAligner::default();
+        let base = tokio::time::Instant::now();
+        let mut arrival_us: u64 = 0;
+        for (sensor_us, advance_us) in ops {
+            // Arrivals advance monotonically, as real message arrivals do;
+            // the sensor stamp is whatever the wire claims.
+            arrival_us = arrival_us.saturating_add(advance_us as u64);
+            let arrival = base + std::time::Duration::from_micros(arrival_us);
+            let aligned = aligner.align(sensor_us, arrival);
+            prop_assert!(
+                aligned.saturating_duration_since(arrival) <= MAX_SKEW,
+                "aligned stamp led arrival by {:?} (bound {:?}) for sensor_us={:?}",
+                aligned.saturating_duration_since(arrival), MAX_SKEW, sensor_us
+            );
+        }
     }
 
     /// Plausibility gate: a non-finite coordinate is ALWAYS rejected (NaN/Inf

@@ -42,12 +42,14 @@ impl Attestation {
     /// Capture the current process's identity. Cheap-ish (one SHA-256 over
     /// the binary, ~30 MB → ~50 ms on a Pi 4). Run once at startup.
     pub fn capture() -> Self {
-        let binary_path = std::env::current_exe()
-            .ok()
-            .map(|p| p.display().to_string());
-        let binary_sha256 = std::env::current_exe()
-            .ok()
-            .and_then(|p| sha256_of_file(&p).ok());
+        // Resolve current_exe ONCE and derive both fields from it (audit D5):
+        // two separate lookups could disagree if the executable is swapped
+        // mid-startup, producing a path/hash pair that describes two
+        // different files — poisonous for a record whose whole job is
+        // provenance.
+        let exe = std::env::current_exe().ok();
+        let binary_path = exe.as_deref().map(|p| p.display().to_string());
+        let binary_sha256 = exe.as_deref().and_then(|p| sha256_of_file(p).ok());
         Attestation {
             crate_version: env!("CARGO_PKG_VERSION").to_string(),
             build_profile: if cfg!(debug_assertions) {

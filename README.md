@@ -420,9 +420,39 @@ Plus a deterministic Monte Carlo unit test that runs 600 s of realistic
 false alarms, while still firing on a genuine drift above the learned noise
 floor.
 
+### Fuzzing
+
+Every byte the detector ingests comes from somewhere untrusted — an NMEA
+receiver on a UART, MAVLink datagrams on a shared link. The pre-public audit
+found a **one-packet remote DoS** on exactly that boundary: a crafted wire
+timestamp overflowed a monotonic `Instant` inside `ClockAligner::align` and
+panicked, killing the listener task and with it the whole detector. `fuzz/`
+holds the standing net for that bug class:
+
+```bash
+cargo +nightly fuzz run clock_aligner -- -max_total_time=300
+cargo +nightly fuzz run nmea_parse    -- -max_total_time=300
+cargo +nightly fuzz run mav_ingest    -- -max_total_time=300
+```
+
+Each target drives the **real** public functions the listener calls (not a
+test double), and asserts two things: no panic on any input, and that whatever
+the plausibility gates *accept* is finite and in range — the contract the
+detector's residual arithmetic depends on.
+
+Requires a nightly toolchain, and **Linux**: libFuzzer's sanitizer
+instrumentation does not link under Windows MSVC. The `fuzz.yml` workflow runs
+the search nightly and build-checks the targets on every push that touches the
+code they cover. The `ClockAligner` bound is *additionally* asserted as a
+`proptest` property (`clock_aligner_never_leads_arrival_beyond_skew_bound`) so
+it runs on every platform in the ordinary `cargo test` suite.
+
 ## Continuous integration & releases
 
-Two GitHub Actions workflows live in `.github/workflows/`:
+Five GitHub Actions workflows live in `.github/workflows/` — `ci.yml`,
+`release.yml`, and `fuzz.yml` are described below; the two nightly live-SITL
+workflows (`sitl.yml` for ArduPilot, `sitl-px4.yml` for PX4) are documented in
+[`docs/sitl.md`](docs/sitl.md).
 
 **`ci.yml`** runs on every push and pull request:
 
@@ -440,6 +470,14 @@ real-hardware code path breaks while the default test suite stays green — the
 NMEA-feature regression (which made the serial-GPS backend silently produce
 zero fixes) is the canonical example, and it now has a dedicated regression
 test this job runs.
+
+**`fuzz.yml`** runs the coverage-guided fuzz targets (see
+[Fuzzing](#fuzzing) above) nightly, and build-checks them on every push that
+touches `fuzz/` or the decode paths they cover — so the targets can't silently
+rot against a refactor of the code they're meant to protect. A crash fails the
+job and uploads the reproducing input as an artifact. It is deliberately
+separate from `ci.yml`: a timed fuzz run is a search, not a deterministic
+gate, and must never block a PR on how lucky the mutator got.
 
 **`release.yml`** fires on a version tag (`git tag v0.1.0 && git push --tags`):
 it re-verifies fmt + clippy + tests, cross-compiles release binaries for

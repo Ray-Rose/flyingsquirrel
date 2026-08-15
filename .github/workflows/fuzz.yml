@@ -1,0 +1,129 @@
+name: Fuzz (nightly)
+
+# Coverage-guided fuzzing of the three untrusted-input decode paths:
+# NMEA-over-serial, the MAVLink datagram chain, and the clock aligner.
+#
+# WHY this exists: the detector's pre-public audit found a one-packet remote
+# DoS in `ClockAligner::align` — an attacker-controlled wire timestamp
+# overflowed a monotonic `Instant` and PANICKED, killing the listener task and
+# with it the whole detector. That was caught by adversarial review, which does
+# not run every night. This workflow is the standing net for that bug class.
+#
+# Separate workflow (not part of per-push `ci.yml`) for two reasons: it needs a
+# nightly toolchain for libFuzzer's sanitizer instrumentation, and a timed fuzz
+# run is a search, not a deterministic gate — it must never gate a PR on how
+# lucky the mutator got.
+#
+# The `build` job DOES run on push/PR so the targets can't silently bitrot
+# against a refactor of the code they fuzz (that failure mode is what makes
+# "we have fuzzing" claims stale). Finding a crash in the nightly `fuzz` job
+# fails it loudly and uploads the reproducing input as an artifact.
+on:
+  schedule:
+    - cron: "17 6 * * *" # ~06:17 UTC nightly (ahead of the SITL workflows)
+  workflow_dispatch:
+    inputs:
+      duration_s:
+        description: "Seconds to fuzz per target"
+        required: false
+        default: "300"
+  push:
+    branches: ["**"]
+    paths:
+      # Build-check only where it can actually break: the fuzz crate itself,
+      # the decode paths under test, or the workflow. `src/hw/**` is in the
+      # list because `nmea_parse` drives the real `NmeaLineCodec` — a refactor
+      # there that stopped compiling against the target is precisely the
+      # bitrot this job exists to catch.
+      - "fuzz/**"
+      - "src/mav/**"
+      - "src/ingest/**"
+      - "src/hw/**"
+      - "src/types.rs"
+      - ".github/workflows/fuzz.yml"
+  pull_request:
+    paths:
+      - "fuzz/**"
+      - "src/mav/**"
+      - "src/ingest/**"
+      - "src/hw/**"
+      - "src/types.rs"
+      - ".github/workflows/fuzz.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---- Cheap bitrot guard: do the targets still compile? ----
+  build:
+    name: build fuzz targets
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch; toolchain selected below
+        with:
+          # SHA-pinned, so the branch no longer selects the toolchain — name it.
+          # libFuzzer's instrumentation (-Zsanitizer) is nightly-only.
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          # The fuzz crate is its own workspace (detached so root `cargo test`
+          # never builds it), so both trees need caching.
+          workspaces: |
+            .
+            fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Build all targets
+        run: cargo +nightly fuzz build
+
+  # ---- The actual search ----
+  fuzz:
+    name: fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: build
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false # one crashing target must not hide the others' results
+      matrix:
+        target: [nmea_parse, clock_aligner, mav_ingest]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch; toolchain selected below
+        with:
+          # SHA-pinned, so the branch no longer selects the toolchain — name it.
+          # libFuzzer's instrumentation (-Zsanitizer) is nightly-only.
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          # The fuzz crate is its own workspace (detached so root `cargo test`
+          # never builds it), so both trees need caching.
+          workspaces: |
+            .
+            fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Fuzz ${{ matrix.target }}
+        # -runs/-max_total_time bound the search; -rss_limit_mb guards the
+        # runner. A crash exits non-zero and fails the job — that is the point.
+        run: |
+          cargo +nightly fuzz run "${{ matrix.target }}" -- \
+            -max_total_time="${{ github.event.inputs.duration_s || '300' }}" \
+            -rss_limit_mb=2048 \
+            -max_len=4096
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: |
+            fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore

@@ -636,8 +636,14 @@ const CLOCK_ALIGN_MAX_SKEW: std::time::Duration = std::time::Duration::from_secs
 /// back to arrival time, i.e. exactly the prior behavior. It is PER-STREAM
 /// because the GPS and IMU clocks may use different bases (boot-relative vs UNIX
 /// epoch); mapping each stream by its OWN deltas cancels the absolute base.
+///
+/// `pub` so the fuzz harness (`fuzz/fuzz_targets/clock_aligner.rs`) can drive
+/// the real implementation rather than a copy: this is the code that took an
+/// attacker-controlled wire timestamp straight into an `Instant` add and
+/// panicked (one-packet remote kill of the listener task), so it is exactly
+/// the surface where a divergent test double would be worthless.
 #[derive(Debug, Default)]
-struct ClockAligner {
+pub struct ClockAligner {
     /// (local arrival Instant, sensor µs) captured at the current anchor.
     anchor: Option<(Instant, u64)>,
 }
@@ -645,7 +651,7 @@ struct ClockAligner {
 impl ClockAligner {
     /// Local-monotonic Instant to stamp on a message whose autopilot sensor
     /// timestamp is `sensor_us` (None if absent) and that arrived at `arrival`.
-    fn align(&mut self, sensor_us: Option<u64>, arrival: Instant) -> Instant {
+    pub fn align(&mut self, sensor_us: Option<u64>, arrival: Instant) -> Instant {
         let Some(s) = sensor_us else {
             // No usable sensor timestamp → arrival time. Leave the anchor intact
             // so one missing stamp doesn't reset the established alignment.
@@ -698,7 +704,7 @@ impl ClockAligner {
 /// if absent (`time_usec = 0`, the "unknown" sentinel). The absolute base
 /// (boot-relative or UNIX epoch) doesn't matter — `ClockAligner` uses per-message
 /// deltas, so the base cancels.
-fn gps_sensor_us(msg: &MavMessage) -> Option<u64> {
+pub fn gps_sensor_us(msg: &MavMessage) -> Option<u64> {
     match msg {
         MavMessage::GPS_RAW_INT(g) if g.time_usec != 0 => Some(g.time_usec),
         _ => None,
@@ -708,7 +714,7 @@ fn gps_sensor_us(msg: &MavMessage) -> Option<u64> {
 /// The autopilot's per-stream sensor timestamp (µs) for an IMU message, or None
 /// if absent. `HIGHRES_IMU.time_usec` is already µs; `SCALED_IMU*` carry
 /// `time_boot_ms` (ms since boot) → ×1000.
-fn imu_sensor_us(msg: &MavMessage) -> Option<u64> {
+pub fn imu_sensor_us(msg: &MavMessage) -> Option<u64> {
     match msg {
         MavMessage::HIGHRES_IMU(i) if i.time_usec != 0 => Some(i.time_usec),
         MavMessage::SCALED_IMU(i) if i.time_boot_ms != 0 => Some(i.time_boot_ms as u64 * 1000),

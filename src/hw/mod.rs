@@ -10,10 +10,22 @@
 
 pub mod serial_gps;
 
+/// NMEA byte framing + link-health diagnosis for the serial GPS path. Pure
+/// logic, not feature-gated — same rationale as `mpu6050` below: `serial_gps`
+/// owns the port, this owns what the bytes mean, and only the latter can be
+/// unit-tested without the hardware attached.
+pub mod nmea_link;
+
 /// Sensor-to-body axis remap (for arbitrarily-mounted IMUs). Not feature-gated
 /// so the remap math is unit-tested on every platform, even though it is only
 /// applied on the Linux I2C path today.
 pub mod axis_map;
+
+/// MPU-6050 register decode, WHO_AM_I identity check, and the read-health
+/// escalation ladder (degraded-warn → in-process re-init → stream-end).
+/// Pure logic, not feature-gated — same rationale as `axis_map`: the policy
+/// is unit-tested on every platform; only the bus I/O is Linux-gated.
+pub mod mpu6050;
 
 #[cfg(all(feature = "hw-i2c", target_os = "linux"))]
 pub mod i2c_imu;
