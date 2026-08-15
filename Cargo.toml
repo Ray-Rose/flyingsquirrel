@@ -68,7 +68,7 @@ bytes = "1"
 toml = "0.8"
 sha2 = "0.10"
 ratatui = "0.29"
-crossterm = "0.28"
+crossterm = "0.29"
 
 # Linux-only I2C IMU driver. Pulled in only when explicitly requested by
 # enabling the `hw-i2c` feature, and a target_os = "linux" cfg-gate keeps
