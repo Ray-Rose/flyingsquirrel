@@ -27,7 +27,7 @@ jobs:
     name: verify before release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # tag push → github.ref is the tag; manual dispatch → the `tag` input
           # (so we never build the default branch by accident). Fallback keeps
@@ -38,7 +38,7 @@ jobs:
           # SHA-pinned, so the tag no longer selects the toolchain — name it.
           toolchain: stable
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-targets --all-features
@@ -55,7 +55,7 @@ jobs:
           - armv7-unknown-linux-gnueabihf
           - x86_64-unknown-linux-gnu
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # tag push → github.ref is the tag; manual dispatch → the `tag` input
           # (so we never build the default branch by accident). Fallback keeps
@@ -65,7 +65,7 @@ jobs:
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: release-${{ matrix.target }}
       - name: Install cross linker
@@ -116,7 +116,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # tag push → github.ref is the tag; manual dispatch → the `tag` input
           # (so we never build the default branch by accident). Fallback keeps
@@ -138,7 +138,7 @@ jobs:
           ls -la release/
           cat release/SHA256SUMS
       - name: Create / update GitHub Release
-        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           # Explicit tag so manual workflow_dispatch runs attach to the chosen
           # tag; on a tag push github.ref_name is that tag (same as the default).
