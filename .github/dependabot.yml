@@ -9,7 +9,9 @@
 # — automatically, and earlier.
 version: 2
 updates:
-  # GitHub Actions — all four workflows pin actions by commit SHA.
+  # GitHub Actions — every workflow pins actions by commit SHA. `directory: "/"`
+  # scans all of `.github/workflows/`, so a newly added workflow (fuzz.yml was
+  # the most recent) is covered without touching this file.
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
@@ -27,6 +29,23 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+
+  # The fuzz harness is a SEPARATE, detached workspace (`fuzz/Cargo.toml` has
+  # its own `[workspace]`, and the root manifest excludes it), so the `/` entry
+  # above does not reach it — a detached lockfile is invisible to both this
+  # updater and the root `cargo audit` gate.
+  #
+  # It needs its own entry for a reason specific to what fuzzing is FOR: the
+  # targets deliberately mirror the parent's `mavlink` and `nmea` versions so
+  # they exercise the code that actually ships. Left unmanaged, that mirror
+  # silently drifts and the nightly search starts reporting green over a
+  # decoder the detector no longer uses — the exact bitrot `fuzz.yml`'s build
+  # job exists to prevent, arriving through the dependency tree instead.
+  - package-ecosystem: cargo
+    directory: "/fuzz"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
 
   # Docker base images in the shipped detector image (deploy/Dockerfile).
   - package-ecosystem: docker
