@@ -75,7 +75,7 @@ tokio-serial = "5.4"
 tokio-util = { version = "0.7", features = ["codec"] }
 bytes = "1"
 toml = "1.1"
-sha2 = "0.10"
+sha2 = "0.11"
 
 # Linux-only I2C IMU driver. Pulled in only when explicitly requested by
 # enabling the `hw-i2c` feature, and a target_os = "linux" cfg-gate keeps
