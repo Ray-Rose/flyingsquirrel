@@ -53,7 +53,7 @@ tokio-stream = "0.1"
 futures = "0.3"
 async-trait = "0.1"
 async-stream = "0.3"
-nalgebra = { version = "0.33", default-features = false, features = ["std"] }
+nalgebra = { version = "0.35", default-features = false, features = ["std"] }
 # AUDIT I-01 fix: the `nmea` crate feature-gates EVERY sentence type. With
 # only `["std"]` enabled, `parser.parse()` returns `Err(DisabledSentence)`
 # for GGA/RMC/VTG — i.e. the serial-GPS backend produced ZERO fixes on real
