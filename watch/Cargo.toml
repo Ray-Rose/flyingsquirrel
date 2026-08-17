@@ -1,0 +1,61 @@
+[package]
+name = "flyingsquirrel-watch"
+version = "0.1.0"
+edition = "2021"
+# Independently determined: this crate's binding constraint is ratatui
+# (-> instability -> darling 0.23, which needs 1.88). It happens to match the
+# detector's floor today, but the two are now decoupled — that is the point.
+# A future ratatui bump that raises the requirement fails HERE instead of
+# silently raising the detector's published MSRV.
+rust-version = "1.88"
+description = "Terminal dashboard for FlyingSquirrel JSON event logs."
+license = "MIT OR Apache-2.0"
+authors = ["Ray Rose"]
+repository = "https://github.com/Ray-Rose/flyingsquirrel"
+homepage = "https://github.com/Ray-Rose/flyingsquirrel"
+keywords = ["gps", "spoofing", "drone", "tui", "monitoring"]
+categories = ["aerospace", "command-line-utilities"]
+
+# DETACHED from the detector's workspace, deliberately — this is the whole
+# point of the crate existing separately rather than as a third `[[bin]]`.
+#
+# The dashboard is an operator convenience that reads the detector's JSON event
+# log. It shares NO code with the detector (it deserializes the log with its
+# own loose structs so a schema change cannot break it), yet as a bin target in
+# the root package its dependency tree was welded to the safety-critical one:
+#
+#   * `ratatui` -> `lru 0.12` carried RUSTSEC-2026-0002 and RUSTSEC-2026-0253
+#     into the detector's `cargo audit`. Both were accepted with the rationale
+#     "ratatui's widget cache, NOT the detector" — true, but nothing in the
+#     build enforced it. Now the separation is structural, and those two
+#     ignores are gone from `ci.yml` rather than argued.
+#   * `ratatui` -> `instability` -> `darling 0.23` was the SOLE reason the
+#     detector's MSRV was 1.88 rather than 1.85.
+#   * A terminal UI shipped inside every ARM cross-build, the Docker image,
+#     and even `fuzz/Cargo.lock` — a fuzz harness for NMEA/MAVLink decoding
+#     was receiving Dependabot PRs for a TUI library.
+#
+# A detached workspace (its own `Cargo.lock`), not a workspace member: members
+# share one lockfile, which would leave `lru` in the detector's audit scope and
+# defeat the purpose. Same pattern, same reason, as `fuzz/`.
+[workspace]
+
+[[bin]]
+name = "flyingsquirrel-watch"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+ratatui = "0.29"
+crossterm = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# The log-tailing tests write real files; this came from the root package's
+# dev-dependencies before the split.
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

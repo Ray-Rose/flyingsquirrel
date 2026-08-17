@@ -177,6 +177,27 @@ docker build -f deploy/Dockerfile -t flyingsquirrel:latest .
 bash deploy/docker-run.sh
 ```
 
+### 3b. Operator dashboard (optional)
+
+`flyingsquirrel-watch` is a terminal dashboard over the JSON event log — live
+`--tail` for flight ops, `--replay` for post-incident review. It is a **separate
+crate** in `watch/`, built on its own:
+
+```bash
+cd watch && cargo build --release
+./target/release/flyingsquirrel-watch /var/log/flyingsquirrel/events.jsonl
+```
+
+It is deliberately not part of the detector's build. The dashboard shares no
+code with the detector — it reads the event log with its own permissive structs,
+so a schema change can't break it — but as a `[[bin]]` in the root package its
+dependency tree was welded to the safety-critical one. That coupling put
+`ratatui → lru` (two unsoundness advisories) into the detector's `cargo audit`
+scope, its ARM cross-builds, its Docker image, and even the fuzz harness's
+lockfile. Splitting it out removed 34 crates from the detector and let those two
+advisory suppressions be **deleted rather than justified**. Release tarballs
+still ship both binaries.
+
 ### 4. Run
 
 ```toml
@@ -460,9 +481,10 @@ workflows (`sitl.yml` for ArduPilot, `sitl-px4.yml` for PX4) are documented in
 |---|---|
 | `fmt` | `cargo fmt --all --check` — formatting is enforced, not suggested |
 | `test` | `clippy --all-targets --all-features -D warnings`, then `cargo test` with **default AND all features** + doc tests. The all-features run compiles the Linux-only `hw-i2c` / `journald` paths so they can't silently rot |
-| `msrv` | builds against the declared MSRV (Rust 1.88, `--locked`) so `rust-version` can never drift from reality. 1.88 is the real floor (set by `darling`/`instability` via `ratatui`), determined empirically by building in Docker; this job exists because earlier unverified MSRV claims silently didn't build |
+| `msrv` | builds against the declared MSRV (Rust 1.88, `--locked`) so `rust-version` can never drift from reality. 1.88 is the real floor, re-derived after the TUI split — it is now set by `nmea → serde_with → time`, a core functional dependency, where it used to be set by `ratatui`. This job exists because earlier unverified MSRV claims silently didn't build |
 | `cross` | cross-compiles release binaries for `aarch64-unknown-linux-gnu` and `armv7-unknown-linux-gnueabihf` (the real deploy targets) with `hw-i2c,journald`, and verifies the ELF architecture |
-| `audit` | `cargo audit` — fails on any RUSTSEC advisory in the dependency tree |
+| `audit` | `cargo audit` — fails on any RUSTSEC advisory in the dependency tree. Three transitive advisories are accepted with written rationale (`paste` unmaintained; two `quick-xml` build-time DoS); the two `lru` ones are gone entirely since the TUI split |
+| `watch` | fmt + clippy + tests + a **separate** `cargo audit` for the detached `watch/` dashboard crate. Nothing in the jobs above compiles it, so without this gate it would rot silently |
 | `docker` | builds `deploy/Dockerfile` to validate the container image |
 
 The all-features test job exists specifically to catch the class of bug where a

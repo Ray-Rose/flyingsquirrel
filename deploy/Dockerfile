@@ -10,11 +10,15 @@
 #   host network for MAVLink UDP (or expose 14551/udp explicitly)
 
 # -------- builder --------
-# Rust 1.88 is the MSRV, empirically determined by building this exact locked
-# dependency tree (Phase V, in Docker): darling 0.23 + instability 0.3.12
-# (transitive via ratatui) require rustc 1.88; clap_lex 1.1 requires the
-# edition2024 feature (1.85). 1.88 is the binding constraint. Keep this in
-# sync with Cargo.toml `rust-version` and the CI `msrv` job.
+# This image tracks a CURRENT toolchain, deliberately — it is NOT the MSRV
+# gate. Building the shipped artifact with an up-to-date compiler is what we
+# want (toolchain security fixes, better codegen); proving the declared
+# `rust-version` still builds is a separate concern owned by the CI `msrv` job,
+# which pins exactly 1.88 with `--locked`. Keeping both duties on this one
+# FROM line is what let Dependabot's 1.88 -> 1.97 bump silently invalidate an
+# "MSRV = 1.88, keep in sync" comment that used to live here.
+# (The MSRV itself is 1.88, now bound by `nmea -> serde_with -> time`; see the
+# reasoning in Cargo.toml.)
 # Digest-pinned for a reproducible, supply-chain-hardened build. The tag is kept
 # for humans; Docker resolves by digest. Dependabot (.github/dependabot.yml,
 # docker ecosystem) opens a PR when the base image updates, so the pin stays

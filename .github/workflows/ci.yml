@@ -153,24 +153,13 @@ jobs:
         run: cargo install cargo-audit --locked
       - name: Scan dependency tree for RUSTSEC advisories
         # `--deny warnings` fails on any advisory, including informational
-        # "unmaintained"/"unsound" notices. Five TRANSITIVE advisories are
+        # "unmaintained"/"unsound" notices. THREE transitive advisories are
         # explicitly accepted — none is reachable in the runtime flight path,
         # and none has a semver-compatible patched version available without a
         # major dependency migration:
         #   * RUSTSEC-2024-0436  paste 1.0.15 — UNMAINTAINED. A build-time
-        #     proc-macro pulled by BOTH ratatui and nalgebra/simba; abandoned
-        #     upstream with no replacement. No runtime code, no vulnerability.
-        #   * RUSTSEC-2026-0002  lru 0.12.5 — unsound `IterMut`. Pulled ONLY by
-        #     ratatui's TUI widget cache (the flyingsquirrel-watch monitor), NOT
-        #     the safety-critical detector. ratatui 0.29 pins `lru = 0.12`, so no
-        #     semver-compatible patched version is available.
-        #   * RUSTSEC-2026-0253  lru 0.12.5 — unsound `LruCache::pop()` (potential
-        #     use-after-free ONLY if a caller-supplied Drop/Hash panics mid-pop;
-        #     not triggerable by wire input). Same crate, same sole path as
-        #     RUSTSEC-2026-0002 above: ratatui's internal widget cache in the
-        #     flyingsquirrel-watch monitor TUI, NOT the detector. Patched only in
-        #     lru >=0.18.2; ratatui 0.29 pins `lru = 0.12`, so no semver-compatible
-        #     patched version exists. Revisit when ratatui is next upgraded.
+        #     proc-macro pulled by nalgebra/simba; abandoned upstream with no
+        #     replacement. No runtime code, no vulnerability.
         #   * RUSTSEC-2026-0194 + RUSTSEC-2026-0195  quick-xml 0.36.2 — two DoS
         #     advisories (quadratic duplicate-attribute scan; unbounded
         #     namespace-declaration allocation). quick-xml is a BUILD-dependency
@@ -182,8 +171,57 @@ jobs:
         #     migration deferred to its own change.
         # NB: RUSTSEC-2026-0190 (anyhow unsound downcast_mut) is deliberately
         # NOT ignored — it was fixed by upgrading anyhow to 1.0.103 in Cargo.lock.
+        #
+        # REMOVED, not suppressed: RUSTSEC-2026-0002 and RUSTSEC-2026-0253 (both
+        # `lru 0.12.5`, unsound) used to be ignored here on the grounds that lru
+        # reached us only through ratatui's widget cache in the operator TUI and
+        # never through the detector. That was true but unenforced — the TUI was
+        # a bin target in this same package, so `lru` sat in the detector's
+        # lockfile, its ARM cross-builds, its Docker image, and even
+        # `fuzz/Cargo.lock`. Moving the dashboard to the detached `watch/` crate
+        # made the claim structural: `lru` is no longer in this tree at all, so
+        # the advisories are gone rather than argued. `watch/` runs its own audit
+        # (see the `watch` job) where those two are ignored with that same
+        # rationale — but now it is the honest scope.
         # Real vulnerabilities and any NEW advisory still fail this gate.
-        run: cargo audit --deny warnings --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2026-0002 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2026-0253
+        run: cargo audit --deny warnings --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
+
+  # ---- Operator dashboard: detached crate, so it needs its own gate ----
+  watch:
+    name: watch TUI (detached crate)
+    runs-on: ubuntu-latest
+    # `watch/` has its own workspace and lockfile, so NOTHING in the jobs above
+    # compiles it — `cargo test` at the root cannot see it. Without this job the
+    # dashboard would rot silently, which is the standing cost of detaching a
+    # crate and the reason `fuzz/` carries an equivalent build gate.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: watch
+      - name: clippy (deny warnings)
+        run: cargo clippy --all-targets --manifest-path watch/Cargo.toml -- -D warnings
+      - name: fmt
+        run: cargo fmt --manifest-path watch/Cargo.toml -- --check
+      - name: test
+        run: cargo test --all-targets --manifest-path watch/Cargo.toml
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Scan the dashboard's own dependency tree
+        # The two `lru 0.12.5` unsoundness advisories (RUSTSEC-2026-0002 IterMut,
+        # RUSTSEC-2026-0253 pop) live HERE now, which is the honest scope: lru
+        # arrives solely via ratatui's widget cache, and ratatui 0.29 pins
+        # `lru = 0.12` so no semver-compatible patched version exists. This is a
+        # log-reading dashboard, not the flight-path detector — the same
+        # rationale the root gate used to carry, except now the build enforces
+        # the boundary instead of a comment asserting it.
+        # `paste` (RUSTSEC-2024-0436, unmaintained build-time proc-macro) also
+        # reaches ratatui. Revisit all three when ratatui next releases.
+        run: cargo audit --deny warnings --file watch/Cargo.lock --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2026-0002 --ignore RUSTSEC-2026-0253
 
   # ---- Docker image build (validates deploy/Dockerfile) ----
   docker:

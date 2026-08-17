@@ -29,6 +29,11 @@ __pycache__/
 # inputs, build tree, and crash artifacts are not. A crash artifact worth
 # keeping gets promoted into a regression test, not committed here.
 /fuzz/target/
+# The operator dashboard is a detached workspace, so it builds into its own
+# target dir rather than the root one. Its Cargo.lock IS committed (detached
+# workspaces get no lockfile from the root; a reproducible dashboard build
+# needs its own).
+/watch/target/
 /fuzz/artifacts/
 /fuzz/coverage/
 

@@ -47,6 +47,16 @@ updates:
       interval: weekly
     open-pull-requests-limit: 3
 
+  # The operator dashboard, also a detached workspace (see watch/Cargo.toml).
+  # It carries the TUI stack — ratatui and its `lru`/`paste` advisories — which
+  # is exactly why it is not in the detector's tree. Keeping it updated here is
+  # how the eventual ratatui release that drops those advisories reaches us.
+  - package-ecosystem: cargo
+    directory: "/watch"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+
   # Docker base images in the shipped detector image (deploy/Dockerfile).
   - package-ecosystem: docker
     directory: "/deploy"
