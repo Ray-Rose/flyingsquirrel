@@ -30,8 +30,9 @@
 //!   r                resume auto-scroll
 //!   c                clear visible buffer (does not affect source file)
 //!
-//! Build:
-//!   cargo build --release --bin flyingsquirrel-watch
+//! Build (this is a DETACHED crate — build it from `watch/`, not the repo
+//! root; see `watch/Cargo.toml` for why it is separate from the detector):
+//!   cd watch && cargo build --release
 
 use clap::Parser;
 use crossterm::event::{self, Event as CtEvent, KeyCode, KeyEvent, KeyModifiers};

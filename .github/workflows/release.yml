@@ -85,6 +85,12 @@ jobs:
           esac
       - name: Build release binaries (hw-i2c + journald)
         run: cargo build --release --locked --features hw-i2c,journald --target ${{ matrix.target }}
+      - name: Build the operator dashboard (detached crate)
+        # `watch/` has its own workspace and lockfile, so the build above does
+        # not produce it — that separation is what keeps the TUI's dependency
+        # tree (ratatui -> lru) out of the detector. It still ships in the same
+        # tarball, so it needs its own explicit build here.
+        run: cargo build --release --locked --manifest-path watch/Cargo.toml --target ${{ matrix.target }}
       - name: Stage artifacts + SHA-256 manifest
         run: |
           set -euo pipefail
@@ -93,9 +99,10 @@ jobs:
           mkdir -p "$OUT"
           # Ship the main detector binary and the watch TUI. mavsim is a test
           # fixture (it emits ATTACK trajectories), deliberately NOT shipped.
-          for bin in flyingsquirrel flyingsquirrel-watch; do
-            cp "target/$TGT/release/$bin" "$OUT/"
-          done
+          # NB two different target dirs: `watch/` is a DETACHED workspace, so
+          # cargo puts its output under `watch/target/`, not the root one.
+          cp "target/$TGT/release/flyingsquirrel" "$OUT/"
+          cp "watch/target/$TGT/release/flyingsquirrel-watch" "$OUT/"
           # SHA-256 manifest — the flyingsquirrel binary's hash here MUST match
           # the `sha256=` field in its startup ATTESTATION log line on the
           # target device. That's the operator's integrity cross-check.

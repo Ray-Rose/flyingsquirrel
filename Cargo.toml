@@ -2,13 +2,21 @@
 name = "flyingsquirrel"
 version = "0.1.0"
 edition = "2021"
-# MSRV = 1.88, the REAL floor empirically determined by building this exact
-# locked dependency tree in Docker (Phase V). The binding constraints:
-#   * darling 0.23 + instability 0.3.12 (transitive via ratatui) need rustc 1.88
-#   * clap_lex 1.1 needs the edition2024 cargo feature (rustc 1.85)
-# 1.88 wins. The CI `msrv` job and deploy/Dockerfile pin 1.88 so the claim is
-# continuously verified and can never drift from reality (audit I-09). The
-# earlier 1.75/1.83/1.85 values were unverified guesses that did not build.
+# MSRV = 1.88, the REAL floor of this exact locked tree — re-derived (not
+# assumed) after the TUI was split out into `watch/`. The binding constraint
+# CHANGED with that split, so the reasoning is worth keeping current:
+#   * WAS: darling 0.23 + instability 0.3.12, transitive via ratatui.
+#   * NOW: `nmea 0.7 -> serde_with -> time 0.3.47`, which declares 1.88.
+#     Reachable on the Linux deploy targets, so it binds the shipped artifact.
+#   * Runners-up: hashbrown/deranged/toml_* at 1.85; clap_lex 1.1 needs the
+#     edition2024 cargo feature (1.85).
+# So removing ratatui did NOT lower the floor — it only moved it onto a CORE
+# functional dependency (the NMEA parser) instead of an operator dashboard,
+# which is the defensible place for it. Verified with a reachability walk over
+# `cargo metadata --filter-platform x86_64-unknown-linux-gnu`, excluding
+# dev-deps. The CI `msrv` job builds `--all-features` at this version so the
+# claim can never drift from reality (audit I-09); earlier 1.75/1.83/1.85
+# values were unverified guesses that did not build.
 rust-version = "1.88"
 description = "GPS/IMU drift cross-correlator: detects coordinate spoofing by comparing GPS-reported position against IMU-dead-reckoned position."
 license = "MIT OR Apache-2.0"
@@ -18,9 +26,11 @@ homepage = "https://github.com/Ray-Rose/flyingsquirrel"
 readme = "README.md"
 keywords = ["gps", "spoofing", "drone", "mavlink", "security"]
 categories = ["aerospace", "embedded"]
-# The fuzz crate is a detached workspace (nightly + libFuzzer only); it is a
-# development harness, not part of the published package.
-exclude = ["fuzz/"]
+# Both are detached workspaces with their own lockfiles, excluded from the
+# published package: `fuzz/` is a nightly+libFuzzer development harness, and
+# `watch/` is the operator dashboard — deliberately kept out of the detector's
+# dependency tree (see watch/Cargo.toml for the full rationale).
+exclude = ["fuzz/", "watch/"]
 
 [lib]
 name = "flyingsquirrel"
@@ -34,9 +44,8 @@ path = "src/bin/flyingsquirrel.rs"
 name = "mavsim"
 path = "src/bin/mavsim.rs"
 
-[[bin]]
-name = "flyingsquirrel-watch"
-path = "src/bin/flyingsquirrel-watch.rs"
+# NB: `flyingsquirrel-watch` is NOT a bin target here. It lives in `watch/` as
+# a detached crate so its TUI dependency tree stays out of the detector's.
 
 [dependencies]
 tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "io-util", "fs", "net"] }
@@ -57,7 +66,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-thiserror = "1.0"
+thiserror = "2.0"
 clap = { version = "4.5", features = ["derive"] }
 rand = "0.8"
 rand_chacha = "0.3"
@@ -65,10 +74,8 @@ mavlink = { version = "0.13", default-features = false, features = ["common", "s
 tokio-serial = "5.4"
 tokio-util = { version = "0.7", features = ["codec"] }
 bytes = "1"
-toml = "0.8"
+toml = "1.1"
 sha2 = "0.10"
-ratatui = "0.29"
-crossterm = "0.28"
 
 # Linux-only I2C IMU driver. Pulled in only when explicitly requested by
 # enabling the `hw-i2c` feature, and a target_os = "linux" cfg-gate keeps
