@@ -74,6 +74,25 @@ pub enum SpoofPattern {
         drift_north_mps: f32,
         drift_east_mps: f32,
     },
+    /// The TAKEOVER MOMENT, isolated. At `apply_at_s` the reported satellite
+    /// count and HDOP step to a new constellation, while lat/lon/velocity stay
+    /// completely honest.
+    ///
+    /// This is deliberately not an attack that moves the vehicle — it is the
+    /// instant BEFORE one does. A competent spoofer captures the receiver
+    /// aligned and only then begins to walk the position off, so during this
+    /// window every residual-based lane is looking at a ~0 residual and, quite
+    /// correctly, sees nothing. The only thing that changed is the metadata:
+    /// the simulated constellation is not the real sky it replaced.
+    ///
+    /// Exists to prove the constellation lane fires here — and, just as
+    /// importantly, that it does NOT escalate all the way to severing GPS on
+    /// its own, since the position data at this point is still perfectly good.
+    ConstellationSwap {
+        apply_at_s: f32,
+        sats_after: u8,
+        hdop_after: f32,
+    },
 }
 
 pub struct SpoofInjector<G: GpsSource> {
@@ -166,6 +185,21 @@ fn apply_spoof(fix: &mut GpsFix, pattern: &SpoofPattern, elapsed_s: f64) {
         }
         return;
     }
+    // Constellation swap — metadata only. Position and velocity stay honest,
+    // so no residual lane has anything to fire on; this isolates the
+    // takeover-moment signal.
+    if let SpoofPattern::ConstellationSwap {
+        apply_at_s,
+        sats_after,
+        hdop_after,
+    } = pattern
+    {
+        if elapsed_s >= *apply_at_s as f64 {
+            fix.sats = Some(*sats_after);
+            fix.hdop = Some(*hdop_after);
+        }
+        return;
+    }
     // Doppler strip — clears speed/course only, leaving lat/lon honest.
     if let SpoofPattern::DropDoppler { after_s } = pattern {
         if elapsed_s >= *after_s as f64 {
@@ -237,6 +271,7 @@ fn apply_spoof(fix: &mut GpsFix, pattern: &SpoofPattern, elapsed_s: f64) {
         SpoofPattern::VelocityInconsistent { .. }
         | SpoofPattern::AltitudeJump { .. }
         | SpoofPattern::DropDoppler { .. }
+        | SpoofPattern::ConstellationSwap { .. }
         | SpoofPattern::ConsistentDrift { .. } => {
             unreachable!("handled above")
         }

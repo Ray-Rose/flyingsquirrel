@@ -134,6 +134,15 @@ pub enum SpoofKind {
     /// be throttling GPS to permanently stall escalation. Operator should
     /// investigate. After this fires, normal FSM accounting resumes.
     DwellPauseExceeded,
+    /// The reported constellation stepped away from the one we had been
+    /// flying under (satellite count and/or HDOP), which is what a receiver
+    /// being captured by a simulated constellation looks like — including a
+    /// suspiciously ABRUPT improvement, since synthesized geometry is cleaner
+    /// than a real sky. Fires at the takeover moment, where the position
+    /// residual is still ~0 and no other lane can see anything yet.
+    /// Corroboration, not proof: a spoofer controls these fields and can forge
+    /// continuity. Reported once per step, never sustained.
+    ConstellationShift,
     /// The same GPS lat/lon has been reported for many consecutive fixes
     /// while the IMU shows the vehicle is moving — either the GPS module
     /// has frozen or an attacker is replaying a captured fix. Treated as

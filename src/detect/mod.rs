@@ -8,6 +8,11 @@
 
 pub mod drift;
 pub mod jump;
+/// Constellation-quality discontinuity — the only lane that watches the GPS
+/// METADATA rather than the residual, so it can fire at the takeover moment,
+/// before any drift has accumulated. Corroboration, not coverage: a spoofer
+/// controls these fields and can forge continuity. See the module docs.
+pub mod quality;
 pub mod residual;
 pub mod state_machine;
 
@@ -81,6 +86,15 @@ pub struct DetectConfig {
     /// see docs/threats.md.
     pub vel_aiding_cusum_k_mps: f32,
     pub vel_aiding_cusum_h: f32,
+    /// Constellation-quality discontinuity lane (see [`quality`]). Watches the
+    /// satellite count and HDOP for a STEP away from the sky we have been
+    /// flying under — the signature of a receiver being captured by a
+    /// simulated constellation. Orthogonal to every other lane: it fires at the
+    /// takeover, where the residual is still ~0 and nothing else can see
+    /// anything. Evadable by a spoofer that forges metadata continuity, so it
+    /// escalates to Suspicious and is deliberately built so it can never
+    /// sustain a firing and sever GPS by itself.
+    pub quality: quality::QualityConfig,
 }
 
 impl Default for DetectConfig {
@@ -122,6 +136,7 @@ impl Default for DetectConfig {
             // realistic-noise + consistent-drift sims.
             vel_aiding_cusum_k_mps: 0.55,
             vel_aiding_cusum_h: 8.0,
+            quality: quality::QualityConfig::default(),
         }
     }
 }
