@@ -67,7 +67,7 @@ tokio-util = { version = "0.7", features = ["codec"] }
 bytes = "1"
 toml = "0.8"
 sha2 = "0.10"
-ratatui = "0.29"
+ratatui = "0.30"
 crossterm = "0.28"
 
 # Linux-only I2C IMU driver. Pulled in only when explicitly requested by
