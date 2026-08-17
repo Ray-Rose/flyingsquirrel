@@ -239,6 +239,12 @@ pub struct Fusion {
     last_gps_alt: Option<(f64, f64)>,
     /// Cached config copy for the vertical-rate threshold.
     max_vertical_rate_mps: f32,
+    /// Constellation-quality lane: tracks the sky we have been flying under so
+    /// a STEP away from it (the takeover signature) can be reported while the
+    /// position residual is still ~0. See `detect::quality`.
+    constellation: crate::detect::quality::ConstellationHealth,
+    /// Cached config copy for the constellation lane.
+    quality_cfg: crate::detect::quality::QualityConfig,
     /// Pre-flight readiness — see `PreflightState` doc.
     preflight: PreflightState,
     checklist: PreflightChecklist,
@@ -315,6 +321,8 @@ impl Fusion {
             frozen_imu_displacement_m: 0.0,
             last_gps_alt: None,
             max_vertical_rate_mps: cfg.detect.max_vertical_rate_mps,
+            constellation: crate::detect::quality::ConstellationHealth::new(),
+            quality_cfg: cfg.detect.quality,
             preflight: PreflightState::Initializing,
             checklist: PreflightChecklist {
                 static_init_done: false,
@@ -1032,6 +1040,52 @@ impl Fusion {
             }
         }
         self.last_gps_alt = Some((fix.alt_m, t_gps_secs));
+
+        // Constellation-quality discontinuity. Every lane above needs the
+        // spoofer to have already MOVED us; this one watches the metadata and
+        // so can fire at the takeover, while the residual is still ~0 — which
+        // is exactly the window a slow walk-off lives in (docs/threats.md
+        // §"velocity-aiding bounds"). It escalates like the other external
+        // anomalies, but `ConstellationHealth` re-baselines on every report and
+        // rate-limits itself, so it CANNOT sustain a firing across the
+        // suspicious→spoofed dwell and sever GPS on its own. Corroboration
+        // only: a spoofer controls these fields and can forge continuity.
+        if let Some(shift) = self
+            .constellation
+            .observe(&fix, t_gps_secs, &self.quality_cfg)
+        {
+            self.fsm.note_external_anomaly();
+            let (sats_base, hdop_base) = self.constellation.baselines();
+            let ev = SpoofingEvent::new(
+                fix.t,
+                SpoofKind::ConstellationShift,
+                self.fsm.state(),
+                r.mag_pos as f32,
+                serde_json::json!({
+                    "shift": format!("{:?}", shift.kind),
+                    "sats_baseline": shift.sats_baseline,
+                    "sats_now": shift.sats_now,
+                    "hdop_baseline": shift.hdop_baseline,
+                    "hdop_now": shift.hdop_now,
+                    "sats_baseline_after_reanchor": sats_base,
+                    "hdop_baseline_after_reanchor": hdop_base,
+                    "reason": "reported constellation stepped away from the one in use — the \
+                               signature of a receiver captured by a simulated constellation. \
+                               An abrupt HDOP IMPROVEMENT counts: synthesized geometry is \
+                               cleaner than a real sky. Corroborating evidence only; a spoofer \
+                               can forge these fields, so this raises the cost of a clean \
+                               takeover rather than closing it",
+                }),
+                self.boot,
+            );
+            let _ = events_tx.send(ev);
+            warn!(
+                shift = ?shift.kind,
+                sats_now = ?shift.sats_now,
+                hdop_now = ?shift.hdop_now,
+                "CONSTELLATION SHIFT — possible spoofer takeover; corroborate with residual lanes"
+            );
+        }
 
         // Observability for an attacker (or broken GPS) hiding behind missing
         // Doppler. Velocity-mismatch detection is skipped while this is true;
