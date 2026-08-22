@@ -26,7 +26,7 @@ tokio-util = { version = "0.7", features = ["codec"] }
 # Same feature set as the parent crate: the `GNSS` bundle is what makes
 # GGA/RMC/VTG decodable at all (audit I-01). Fuzzing with the default features
 # would exercise a parser that rejects every real sentence.
-nmea = { version = "0.7", default-features = false, features = ["std", "GNSS"] }
+nmea = { version = "0.8", default-features = false, features = ["std", "GNSS"] }
 
 [dependencies.flyingsquirrel]
 path = ".."
