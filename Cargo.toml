@@ -60,7 +60,7 @@ nalgebra = { version = "0.33", default-features = false, features = ["std"] }
 # hardware (the detector was blind, silently). The `GNSS` bundle enables the
 # position/velocity sentence set we actually decode (GGA, RMC, VTG, GSA, GSV,
 # GLL, GNS, GST, ...). Verified against nmea-0.7.0 [features] table.
-nmea = { version = "0.7", default-features = false, features = ["std", "GNSS"] }
+nmea = { version = "0.8", default-features = false, features = ["std", "GNSS"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
